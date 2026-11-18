@@ -166,6 +166,7 @@ class ConstraintExprVisitor final : public VNVisitor {
                                            // (shared across all constraints)
     std::set<std::string> m_inlineWrittenVars;  // Per-instance tracking for inline constraints
     VInsertionSet<AstVar*>* m_sizeConstrainedArraysp = nullptr;  // Arrays with size constraints
+    VInsertionSet<AstVar*>* m_uniqueDynArraysp = nullptr;  // Direct class array targets of unique
     AstNodeExpr* m_conditionp = nullptr;  // Condition under which current expression is defined
                                           // (nullptr == always defined)
     AstNodeFTask* m_prepareConstrainedArraysp = nullptr;  // Grow arrays for indexed struct access
@@ -2315,6 +2316,11 @@ class ConstraintExprVisitor final : public VNVisitor {
                     continue;
                 }
 
+                if (m_uniqueDynArraysp && VN_IS(dtypep, DynArrayDType)
+                    && subp->isIntegralOrPacked()) {
+                    m_uniqueDynArraysp->insert(varp);
+                }
+
                 // A with{}-block's own registration must use the per-instance
                 // m_inlineWrittenVars (fresh for each ConstraintExprVisitor pass), not
                 // the permanent, compile-time-once AstVar::user3() -- otherwise a
@@ -3020,7 +3026,8 @@ public:
                                    uint32_t* uniqueConstraintIdp, V3UniqueNames& uniqueNames,
                                    AstNodeFTask* memberrefInitTaskp = nullptr,
                                    VInsertionSet<AstVar*>* sizeConstrainedArraysp = nullptr,
-                                   AstNodeFTask* prepareConstrainedArraysp = nullptr)
+                                   AstNodeFTask* prepareConstrainedArraysp = nullptr,
+                                   VInsertionSet<AstVar*>* uniqueDynArraysp = nullptr)
         : m_classp{classp}
         , m_inlineInitBlockp{inlineInitp}
         , m_memberrefInitTaskp{memberrefInitTaskp}
@@ -3029,6 +3036,7 @@ public:
         , m_memberMap{memberMap}
         , m_writtenVars{writtenVars}
         , m_sizeConstrainedArraysp{sizeConstrainedArraysp}
+        , m_uniqueDynArraysp{uniqueDynArraysp}
         , m_prepareConstrainedArraysp{prepareConstrainedArraysp}
         , m_uniqueConstraintIdp{uniqueConstraintIdp}
         , m_uniqueNames{uniqueNames} {
@@ -3052,6 +3060,13 @@ class SolverSmtLowering final : public V3SolverLowering {
     int m_distNum = 0;  // Dist bucket variable counter within a class for var naming
     std::set<std::string> m_writtenVars;  // Track write_var calls per class to avoid duplicates
     std::map<AstClass*, VInsertionSet<AstVar*>> m_sizeConstrainedArrays;  // Per-class arrays
+    std::map<AstConstraint*, VInsertionSet<AstVar*>> m_constraintUniqueArrays;
+    struct SetupArrays final {
+        AstTask* setupTaskp;
+        AstVar* genp;
+        VInsertionSet<AstVar*> arrays;
+    };
+    std::vector<SetupArrays> m_setupArrays;
     uint32_t m_uniqueConstraintId = 0;  // current ID of unique call
 
     // METHODS
@@ -3291,7 +3306,8 @@ class SolverSmtLowering final : public V3SolverLowering {
         }
     }
 
-    void addUpdateRandVarsBody(AstClass* const nodep, AstFunc* const randomizep) {
+    void addUpdateRandVarsBody(AstClass* const nodep, AstVar* const genp,
+                               AstVar* const randModeVarp) {
         UASSERT_OBJ(!nodep->hasRandVarsUpdate(), nodep, "__VupdateRandVars already exists");
         AstFunc* const updatep = new AstFunc{nodep->fileline(), "__VupdateRandVars"};
         updatep->classMethod(true);
@@ -3300,6 +3316,7 @@ class SolverSmtLowering final : public V3SolverLowering {
         updatep->needsSyms(false);
         nodep->addMembersp(updatep);
         nodep->hasRandVarsUpdate(true);
+        if (genp && randModeVarp) addSetRandMode(updatep, genp, randModeVarp);
 
         for (AstClass* classp = nodep; classp;
              classp = classp->extendsp() ? classp->extendsp()->classp() : nullptr) {
@@ -3852,14 +3869,14 @@ class SolverSmtLowering final : public V3SolverLowering {
         return false;
     }
 
-    // Add write_var calls for each array element after resizing it with array-size constraint
-    void addArrayElemRefresh(FileLine* const fl, AstVar* const arrVarp, AstFunc* const randomizep,
+    // Register the live elements after a callback or a solver-directed resize.
+    void addArrayElemRefresh(FileLine* const fl, AstVar* const arrVarp, AstNodeFTask* const taskp,
                              AstVar* const genp) {
         AstNodeModule* const genModp = VN_AS(genp->user2p(), NodeModule);
         // Array elements of class data type are passed to the solver as separate
         // variables, so passing the original array variable is redundant, because it
         // won't be referenced
-        const uint32_t unpackedDims = arrVarp->dtypep()->dimensions(false).second;
+        const uint32_t unpackedDims = arrVarp->dtypep()->skipRefp()->dimensions(false).second;
         if (isDynArrOfClassTypeRecurse(arrVarp->dtypep())) {
             if (unpackedDims > 1) {
                 arrVarp->v3warn(E_UNSUPPORTED,
@@ -3890,7 +3907,7 @@ class SolverSmtLowering final : public V3SolverLowering {
             methodp->addPinsp(new AstConst{fl, AstConst::Unsized64{}, rmode.index});
         }
 
-        randomizep->addStmtsp(methodp->makeStmt());
+        taskp->addStmtsp(methodp->makeStmt());
     }
 
     AstNodeStmt* newPinSizeVariable(FileLine* const fl, AstVar* const arrVarp,
@@ -4016,6 +4033,17 @@ public:
 
     // V3SolverLowering
     void prepareClass(AstClass* classp) override { createRandomGenerator(classp); }
+    void finish() override {
+        // A derived class or a later inline call can introduce a size proxy. Leave such
+        // declarations to the existing resize/rebuild path. For caller-sized arrays, bind
+        // the live elements after pre_randomize even if the unique block is disabled.
+        for (const SetupArrays& setup : m_setupArrays) {
+            for (AstVar* const varp : setup.arrays) {
+                if (!varp->user4p())
+                    addArrayElemRefresh(varp->fileline(), varp, setup.setupTaskp, setup.genp);
+            }
+        }
+    }
     void startClass(AstClass*) override {
         m_writtenVars.clear();  // Each class has its own set of written variables
     }
@@ -4098,10 +4126,19 @@ public:
                     AstBegin* const holderp = SmtUtil::newItemsHolderp(
                         constrp->fileline(), constrp->itemsp()->unlinkFrBackWithNext());
                     taskp->addStmtsp(wrapIfConstraintMode(nodep, constrp, holderp));
-                    ConstraintExprVisitor{
-                        classp,        m_memberMap,  holderp->declsp(), nullptr,
-                        genp,          randModeVarp, m_writtenVars,     &m_uniqueConstraintId,
-                        m_uniqueNames, randomizep,   &sizeArrays,       prepareArraysTaskp};
+                    ConstraintExprVisitor{classp,
+                                          m_memberMap,
+                                          holderp->declsp(),
+                                          nullptr,
+                                          genp,
+                                          randModeVarp,
+                                          m_writtenVars,
+                                          &m_uniqueConstraintId,
+                                          m_uniqueNames,
+                                          randomizep,
+                                          &sizeArrays,
+                                          prepareArraysTaskp,
+                                          &m_constraintUniqueArrays[constrp]};
                     SmtUtil::replaceWithLowered(holderp);
                 }
             });
@@ -4126,6 +4163,7 @@ public:
                 });
                 AstTask* const setupAllTaskp
                     = SmtUtil::getCreateConstraintSetupFunc(nodep, m_memberMap);
+                VInsertionSet<AstVar*> arrays;
                 for (int d = maxDepth; d >= 0; --d) {
                     nodep->foreachMember(
                         [&](AstClass* const classp, AstConstraint* const constrp) {
@@ -4135,8 +4173,14 @@ public:
                                 = new AstTaskRef{constrp->fileline(), taskp};
                             setupTaskRefp->classOrPackagep(classp);
                             setupAllTaskp->addStmtsp(setupTaskRefp->makeStmt());
+                            const auto it = m_constraintUniqueArrays.find(constrp);
+                            if (it != m_constraintUniqueArrays.end()) {
+                                arrays.insert(it->second.begin(), it->second.end());
+                            }
                         });
                 }
+                if (!arrays.empty())
+                    m_setupArrays.push_back({setupAllTaskp, genp, std::move(arrays)});
             }
             // For derived classes: clone write_var calls from parent's randomize()
             // and save every array that has is size-constrained array to generate
@@ -4218,7 +4262,7 @@ public:
             beginValp = new AstConst{fl, AstConst::WidthedValue{}, 32, 1};
         }
 
-        addUpdateRandVarsBody(nodep, randomizep);
+        addUpdateRandVarsBody(nodep, genp, randModeVarp);
         return beginValp;
     }
     void addAfterClassSolve(AstClass* nodep, AstFunc* randomizep) override {

@@ -31,6 +31,7 @@
 #include <initializer_list>
 #include <iomanip>
 #include <iostream>
+#include <iterator>
 #include <ostream>
 #include <set>
 #include <sstream>
@@ -90,26 +91,20 @@ public:
     // for scalars, "(select arr idx...)" for array element j). Used by BSAT
     // to query/re-assert one whole element's value, not a single bit.
     virtual void emitElement(std::ostream& s, int j) const;
-    // Emit the current runtime value as an SMT bit-vector literal (#b...).
-    // Used by randomize(null) to pin a var to its existing value.
-    virtual void emitConcreteValue(std::ostream& s) const;
+    // Emit the live scalar or element value for randomize(null) and frozen unique operands.
+    virtual void emitConcreteValue(std::ostream& s, int idx = 0) const;
     virtual int totalWidth() const;
     mutable std::shared_ptr<const ArrayInfoMap> m_arrVarsRefp;
     void setArrayInfo(const std::shared_ptr<const ArrayInfoMap>& arrVarsRefp) const {
         m_arrVarsRefp = arrVarsRefp;
     }
-    mutable std::map<std::string, int> count_cache;
-    void clearCountCache() const { count_cache.clear(); }
     int countMatchingElements(const ArrayInfoMap& arr_vars, const std::string& base_name) const {
-        if (VL_LIKELY(count_cache.find(base_name) != count_cache.end()))
-            return count_cache[base_name];
-        int count = 0;
-        for (int index = 0; arr_vars.find({base_name, index}) != arr_vars.end();
-             ++index) {
-            ++count;
-        }
-        count_cache[base_name] = count;
-        return count;
+        // Ordinals for a symbol are dense from zero. Inline generators and object copies
+        // can share this descriptor, so use the table of the solver performing the lookup.
+        const auto end = arr_vars.upper_bound({base_name, std::numeric_limits<int>::max()});
+        if (end == arr_vars.begin()) return 0;
+        const ArrayInfoKey& key = std::prev(end)->first;
+        return key.first == base_name ? key.second + 1 : 0;
     }
     bool hasMatchingElements(const ArrayInfoMap& arr_vars, const std::string& base_name) const {
         return arr_vars.find({base_name, 0}) != arr_vars.end();
@@ -276,7 +271,7 @@ class VlRandomizer VL_NOT_FINAL {
     std::set<std::string> m_randcVarNames;  // Names of randc variables for cyclic tracking
     std::map<std::string, std::set<uint64_t>>
         m_randcUsedValues;  // Previously used values per randc var (exclusion-based cycling)
-    size_t m_randcConstraintHash = 0;  // Hash of constraints when history was valid
+    std::map<std::string, size_t> m_randcConstraintHashes;  // Per-variable cycle domains
     std::vector<std::pair<std::string, std::string>>
         m_solveBefore;  // Solve-before ordering pairs (beforeVar, afterVar)
     bool m_checkOnly = false;  // Set for randomize(null)
@@ -312,7 +307,9 @@ class VlRandomizer VL_NOT_FINAL {
     size_t hashConstraints(const std::vector<std::string>& extras) const;
     bool nextRandomize(VlRNGReseeds& rngr, bool checkOnly);
     // "(distinct ...)" expression per unique-constrained array
-    std::vector<std::string> buildUniqueExprs() const;
+    std::vector<std::string> buildUniqueExprs(std::vector<uint32_t>& groupIds) const;
+    void updateRandcHistory(const std::vector<uint32_t>& groupIds,
+                            const std::vector<std::string>& uniqueExprs);
     void emitDefines(std::ostream& os) const;
     void emitDeclares(std::ostream& os, bool pinCurrent) const;
     void emitAsserts(std::ostream& os, const std::vector<std::string>& extras, bool named) const;
@@ -523,7 +520,6 @@ public:
             m_index = 0;
             clear_arr_table(name);
             record_arr_table(var, name, dimension, {}, {});
-            m_vars[name]->clearCountCache();
         }
     }
 
@@ -550,7 +546,6 @@ public:
             m_index = 0;
             clear_arr_table(name);
             record_arr_table(var, name, dimension, {}, {});
-            m_vars[name]->clearCountCache();
         }
     }
     // Register unpacked array of structs
@@ -577,7 +572,6 @@ public:
             m_index = 0;
             clear_arr_table(name);
             record_arr_table(var, name, dimension, {}, {});
-            m_vars[name]->clearCountCache();
         }
     }
 
@@ -874,7 +868,8 @@ public:
         it->second = std::make_shared<const VlRandomArrayVarTemplate<VlQueue<T, N_MaxSize>>>(
             name, it->second->width(), &var, dimension, it->second->randModeIdx());
         m_index = 0;
-        update_arr_table(var, name, dimension);
+        clear_arr_table(name);
+        record_arr_table(var, name, dimension, {}, {});
     }
 
     template <typename T, size_t N_MaxSize>

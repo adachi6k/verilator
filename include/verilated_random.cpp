@@ -735,12 +735,10 @@ void VlRandomVar::emitExtract(std::ostream& s, int i) const {
 void VlRandomVar::emitType(std::ostream& s) const { s << "(_ BitVec " << width() << ')'; }
 // A scalar var IS its only element, so "element j" is just the whole var.
 void VlRandomVar::emitElement(std::ostream& s, int /*j*/) const { s << ' ' << m_name; }
-// Serialize the current runtime value as an SMT-LIB binary literal. Used by
-// randomize(null) to pin a var via `(assert (= var #b...))`. Binary (#b)
-// rather than hex (#x) sidesteps SMT-LIB's hex-width-multiple-of-4 rule.
-void VlRandomVar::emitConcreteValue(std::ostream& s) const {
+// Serialize a state variable or array element as a bit-vector of its exact width.
+void VlRandomVar::emitConcreteValue(std::ostream& s, int idx) const {
     const int w = width();
-    const void* const dp = datap(0);
+    const void* const dp = datap(idx);
     s << "#b";
     for (int i = w - 1; i >= 0; --i) {
         int bit = 0;
@@ -870,7 +868,8 @@ void VlRandomizer::randomConstraint(std::ostream& os, VlRNG& rngr, int bits,
         if (varBits > 2) os << " (bvxor";
         for (const auto& varp : vars) {  // LCOV_EXCL_BR_LINE - reservoir-sampling below
                                          // always forces its last pick before exhausting vars
-            for (int j = 0; j < varp->totalWidth(); j++, varBitsLeft--) {
+            const int width = varp->totalWidth();
+            for (int j = 0; j < width; j++, varBitsLeft--) {
                 const bool doEmit = (VL_RANDOM_RNG_I(rngr) % varBitsLeft) < varBitsWant;
                 if (doEmit) {
                     varp->emitExtract(os, j);
@@ -904,6 +903,51 @@ size_t VlRandomizer::hashConstraints(const std::vector<std::string>& extras) con
         h ^= std::hash<int>{}(elem.first.second) + 0x9e3779b9 + (h << 6) + (h >> 2);
     }
     return h;
+}
+
+// IEEE 1800 18.4.2: a permutation belongs to one randc variable. A change
+// in an independent array's shape changes the sampling cache but not that cycle.
+void VlRandomizer::updateRandcHistory(const std::vector<uint32_t>& groupIds,
+                                      const std::vector<std::string>& uniqueExprs) {
+    for (const std::string& name : m_randcVarNames) {
+        std::set<std::string> related{name};
+        std::set<size_t> terms;
+        const auto connect = [&](size_t term, const auto first, const auto last) {
+            if (terms.count(term)) return;
+            if (std::any_of(first, last, [&](const auto& var) { return related.count(var); })) {
+                related.insert(first, last);
+                terms.insert(term);
+            }
+        };
+        // Include transitive constraints, e.g. c == x and x == a[0].
+        size_t oldSize;
+        do {
+            oldSize = related.size();
+            size_t begin = 0;
+            for (size_t i = 0; i < m_constraints.size(); ++i) {
+                const size_t end = m_constraintVarEnds[i];
+                connect(i, m_constraintVarNames.begin() + begin,
+                        m_constraintVarNames.begin() + end);
+                begin = end;
+            }
+            for (size_t i = 0; i < groupIds.size(); ++i) {
+                const auto& names = m_uniqueArrays.at(groupIds[i]);
+                connect(m_constraints.size() + i, names.begin(), names.end());
+            }
+        } while (related.size() != oldSize);
+        size_t hash = 0;
+        for (size_t term : terms) {
+            const std::string& expr = term < m_constraints.size()
+                                          ? m_constraints[term]
+                                          : uniqueExprs[term - m_constraints.size()];
+            hash ^= std::hash<std::string>{}(expr) + 0x9e3779b9 + (hash << 6) + (hash >> 2);
+        }
+        size_t& previous = m_randcConstraintHashes[name];
+        if (hash != previous) {
+            m_randcUsedValues.erase(name);
+            previous = hash;
+        }
+    }
 }
 
 void VlRandomizer::emitRandcExclusions(std::ostream& os) const {
@@ -972,18 +1016,9 @@ bool VlRandomizer::nextRandomize(VlRNGReseeds& rngr, bool checkOnly) {
     VlSolverSession& sess = s_solverSession;
     const VerilatedLockGuard lock{sess.m_mutex};
     m_checkOnly = checkOnly;
-    const std::vector<std::string> uniqueExprs = buildUniqueExprs();
-
-    // Randc exclusion-based cycling: exclude previously used values per randc var.
-    // When solver returns unsat (all values exhausted), clear history for new cycle.
-    if (!m_randcVarNames.empty()) {
-        const size_t currentHash = hashConstraints(uniqueExprs);
-        // Invalidate history if constraints changed (e.g., constraint_mode toggled)
-        if (currentHash != m_randcConstraintHash) {
-            m_randcUsedValues.clear();
-            m_randcConstraintHash = currentHash;
-        }
-    }
+    std::vector<uint32_t> groupIds;
+    const std::vector<std::string> uniqueExprs = buildUniqueExprs(groupIds);
+    if (!checkOnly && !m_randcVarNames.empty()) updateRandcHistory(groupIds, uniqueExprs);
 
     // Reseeded from outside, so everything cached came from the old seed.
     if (m_ug2.rngReseeds != rngr.reseeds()) m_ug2 = Unigen2State{};
@@ -1000,7 +1035,7 @@ bool VlRandomizer::nextRandomize(VlRNGReseeds& rngr, bool checkOnly) {
     return result;
 }
 
-std::vector<std::string> VlRandomizer::buildUniqueExprs() const {
+std::vector<std::string> VlRandomizer::buildUniqueExprs(std::vector<uint32_t>& groupIds) const {
     std::vector<std::string> exprs;
     if (m_uniqueArrays.empty()) return exprs;
     const auto arrVarsp = std::make_shared<const ArrayInfoMap>(m_arr_vars);
@@ -1016,14 +1051,23 @@ std::vector<std::string> VlRandomizer::buildUniqueExprs() const {
             // or key, rather than by ordinal position
             var.setArrayInfo(arrVarsp);
             // 'distinct' needs at least two operands; fewer elements are trivially unique
-            matchingElementsCount += var.countMatchingElements(*arrVarsp, baseName);
-            var.emitGetValue(varsString);
+            const int count = var.countMatchingElements(*arrVarsp, baseName);
+            matchingElementsCount += count;
+            if (isFrozenVar(baseName, var)) {
+                for (int i = 0; i < count; ++i) {
+                    varsString << ' ';
+                    var.emitConcreteValue(varsString, i);
+                }
+            } else {
+                var.emitGetValue(varsString);
+            }
         }
 
         if (matchingElementsCount < 2) continue;
         std::ostringstream os;
         os << "(__Vbv (distinct " << varsString.str() << "))";
         exprs.push_back(os.str());
+        if (!m_randcVarNames.empty()) groupIds.push_back(keyArrNames.first);
     }
     return exprs;
 }
@@ -1803,7 +1847,7 @@ void VlRandomizer::clearAll() {
     m_vars.clear();
     m_randcVarNames.clear();
     m_randcUsedValues.clear();
-    m_randcConstraintHash = 0;
+    m_randcConstraintHashes.clear();
 }
 
 void VlRandomizer::markRandc(const std::string& name) { m_randcVarNames.insert(name); }
