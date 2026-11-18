@@ -83,6 +83,40 @@ class A4;
   endfunction
 endclass
 
+// Scenario 5: state fields supply the size, including through nested rand handles.
+class C5;
+  rand int count;
+  int length;
+endclass
+
+class B5;
+  rand C5 cfg = new;
+endclass
+
+class A5;
+  typedef enum bit [1:0] {
+    A = 1,
+    B = 2
+  } value_t;
+  C5 cfg = new;
+  rand B5 b = new;
+  rand value_t arr[];
+  constraint c_size {
+    arr.size() == cfg.count;
+    arr.size() == b.cfg.length;
+  }
+
+  function void check_size(int n);
+    cfg.count = n;
+    b.cfg.length = n;
+    if (this.randomize() != 1) $stop;
+    if (cfg.count != n || b.cfg.length != n || arr.size() != n) $stop;
+    foreach (arr[i]) begin
+      if (!(arr[i] inside {A, B})) $fatal(1, "arr[%0d]=%0d, size=%0d", i, arr[i], n);
+    end
+  endfunction
+endclass
+
 module t_constraint_global_subobj;
   B1 b1;
   SA2 a2;
@@ -90,6 +124,7 @@ module t_constraint_global_subobj;
   M3 m3;
   C3 s3;
   A4 a4;
+  A5 a5;
   int prevx, prevy, p3;
   bit varyx, varyy, vary3;
 
@@ -171,6 +206,13 @@ module t_constraint_global_subobj;
       $display("ERROR: a4.arr.size() should be 4, got %0d", a4.arr.size());
       $stop;
     end
+
+    a5 = new;
+    a5.check_size(4);
+    a5.check_size(7);
+    a5.check_size(2);
+    a5.check_size(0);
+    a5.check_size(3);
 
     $write("*-* All Finished *-*\n");
     $finish;

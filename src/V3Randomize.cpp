@@ -1836,6 +1836,9 @@ class RandomizeVisitor final : public VNVisitor {
         return classp->existsMember([](const AstClass*, const AstConstraint* constrp) {
             bool owns = false;
             constrp->foreach([&](const AstMemberRef* memberRefp) {
+                // Only the selected field matters. A rand handle on the way to a
+                // state field does not make that field a solver target.
+                if (!memberRefp->user1() || VN_IS(memberRefp->firstAbovep(), MemberRef)) return;
                 const AstNode* const rootp
                     = const_cast<AstMemberRef*>(memberRefp)->baseFromp(true);
                 if (const AstVarRef* const refp = VN_CAST(rootp, VarRef)) {
