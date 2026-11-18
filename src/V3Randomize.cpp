@@ -1835,10 +1835,16 @@ class RandomizeVisitor final : public VNVisitor {
     bool classOwnsGlobalConstraint(const AstClass* classp) const {
         return classp->existsMember([](const AstClass*, const AstConstraint* constrp) {
             bool owns = false;
+            std::unordered_set<const AstMemberRef*> receivers;
             constrp->foreach([&](const AstMemberRef* memberRefp) {
-                // Only the selected field matters. A rand handle on the way to a
-                // state field does not make that field a solver target.
-                if (!memberRefp->user1() || VN_IS(memberRefp->firstAbovep(), MemberRef)) return;
+                if (owns) return;
+                // foreach visits a field before its receiver. In b.cfgs[i].field, only
+                // b.cfgs supplies the object. Fields in the index are separate operands.
+                if (const AstMemberRef* const receiverp
+                    = VN_CAST(memberRefp->fromp()->getVAccessTargetRecurse(), MemberRef)) {
+                    receivers.insert(receiverp);
+                }
+                if (receivers.erase(memberRefp) || !memberRefp->user1()) return;
                 const AstNode* const rootp
                     = const_cast<AstMemberRef*>(memberRefp)->baseFromp(true);
                 if (const AstVarRef* const refp = VN_CAST(rootp, VarRef)) {

@@ -91,6 +91,18 @@ endclass
 
 class B5;
   rand C5 cfg = new;
+  rand C5 cfgs[1];
+  rand C5 dynamic_cfgs[];
+  rand C5 by_key[int][1];
+  rand C5 queued[$];
+
+  function new();
+    cfgs[0] = cfg;
+    dynamic_cfgs = new[1];
+    dynamic_cfgs[0] = cfg;
+    by_key[7][0] = cfg;
+    queued.push_back(cfg);
+  endfunction
 endclass
 
 class A5;
@@ -104,6 +116,10 @@ class A5;
   constraint c_size {
     arr.size() == cfg.count;
     arr.size() == b.cfg.length;
+    arr.size() == b.cfgs[0].length;
+    arr.size() == b.dynamic_cfgs[0].length;
+    arr.size() == b.by_key[7][0].length;
+    arr.size() == b.queued[$].length;
   }
 
   function void check_size(int n);
@@ -117,6 +133,21 @@ class A5;
   endfunction
 endclass
 
+// Scenario 6: a random child field used as an index is itself constrained.
+class Index6;
+  rand bit [2:0] idx;
+endclass
+
+class A6;
+  rand Index6 child = new;
+  rand bit flags[8];
+  int chosen;
+  constraint c {
+    foreach (flags[i]) flags[i] == (i == chosen);
+    flags[child.idx] == 1;
+  }
+endclass
+
 module t_constraint_global_subobj;
   B1 b1;
   SA2 a2;
@@ -125,6 +156,7 @@ module t_constraint_global_subobj;
   C3 s3;
   A4 a4;
   A5 a5;
+  A6 a6;
   int prevx, prevy, p3;
   bit varyx, varyy, vary3;
 
@@ -213,6 +245,13 @@ module t_constraint_global_subobj;
     a5.check_size(2);
     a5.check_size(0);
     a5.check_size(3);
+
+    a6 = new;
+    for (int i = 0; i < 8; i++) begin
+      a6.chosen = i;
+      if (a6.randomize() != 1) $stop;
+      if (int'(a6.child.idx) != i) $fatal(1, "child.idx=%0d, expected %0d", a6.child.idx, i);
+    end
 
     $write("*-* All Finished *-*\n");
     $finish;
