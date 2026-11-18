@@ -40,6 +40,16 @@ class Sole;
   constraint uniq {unique {arr};}
 endclass
 
+class NumberedArrays;
+  rand bit [4:0] a[11];
+  rand bit [4:0] a1[1];
+  constraint legal {
+    unique {a};
+    foreach (a[i]) a[i] == 5'(i + 1);
+    a1[0] == 29;
+  }
+endclass
+
 module t;
   initial begin
     automatic Sized sized = new;
@@ -65,6 +75,16 @@ module t;
       `checkd(ok, 1);
       foreach (sole.arr[i])
       foreach (sole.arr[j]) if (i != j) `checkh(sole.arr[i] == sole.arr[j], 1'b0);
+    end
+
+    begin
+      automatic NumberedArrays d = new;
+      repeat (3) begin
+        ok = d.randomize();
+        `checkd(ok, 1);
+        foreach (d.a[i]) `checkd(d.a[i], 5'(i + 1));
+        `checkd(d.a1[0], 29);
+      end
     end
 
     $write("*-* All Finished *-*\n");
