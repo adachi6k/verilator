@@ -29,7 +29,6 @@ runs = [
     ('crlf', 1, 16),  # CRLF line endings
     ('diversity_model', 2, 16),  # a diversity round answers with an unusable value
     ('dup_index', 1, 15),  # the same select answered in hex and binary
-    ('extra_dimension', 1, 15),  # a nested select on a one-dimensional queue
     ('dup_model', 1, 15),  # the same variable answered twice
     ('err_assume', 1, 16),  # error in place of the unsat assumptions
     ('err_core', 1, 16),  # error in place of the unsat core
@@ -40,6 +39,7 @@ runs = [
     ('err_trunc', 2, 0),  # unterminated error, then the pipe closes
     ('err_unbal', 2, 15),  # a rejection error closing more parens than it opens
     ('err_unbal_cont', 2, 15),  # a rejection error with the extra paren on a continuation line
+    ('extra_dimension', 1, 15),  # a nested select on a one-dimensional queue
     ('garbage_assume', 1, 16),  # a bare word in place of the unsat assumptions
     ('garbage_model', 1, 15),  # half-valid model must not reach the variables
     ('garbage_status', 2, 15),  # a word that is not a status

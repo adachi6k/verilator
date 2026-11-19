@@ -13,12 +13,12 @@
 # TAMPER: bad_base | bad_digits | bad_index | bad_value | bare_hash | binary
 #         | binary_literals | core_junk | crlf | die_at | die_status_at | diversity_model
 #         | dup_index | dup_model | err_assume | err_core | err_multiline | err_once
-#         | extra_dimension | err_phase | err_reply | err_trunc | err_unbal | err_unbal_cont
+#         | err_phase | err_reply | err_trunc | err_unbal | err_unbal_cont | extra_dimension
 #         | garbage_assume | garbage_at | garbage_model | garbage_status
 #         | high_digit | indent | low_digit | model_trunc | multiline | mute_at
 #         | no_digits | none | octal | oor_assume | phase_model | phase_trunc
-#         | short_index | short_model | stale_assume | success | unknown_once | unknown_twice
-#         | unknown_index | unknown_var | unsat_recheck | unsupported_once | upper_hex
+#         | short_index | short_model | stale_assume | success | unknown_index | unknown_once
+#         | unknown_twice | unknown_var | unsat_recheck | unsupported_once | upper_hex
 #   bad_base         - replace the Nth model reply with a base character that is not b, o, x or h
 #   bad_digits       - replace the Nth model reply with one value holding digits outside its base
 #   bad_index        - replace the first array model reply with a bad select index
@@ -37,12 +37,12 @@
 #   err_core         - replace the first unsat-core reply with (error ...)
 #   err_multiline    - answer the Nth status with an (error ...) split over two lines
 #   err_once         - answer the Nth status with one (error ...) line
-#   extra_dimension  - return a nested select for a one-dimensional array
 #   err_phase        - replace the first phase value reply with (error ...)
 #   err_reply        - replace the Nth S-expression reply with (error ...)
 #   err_trunc        - answer the Nth status with an unterminated (error and close the pipe
 #   err_unbal        - answer the Nth status with an error closing an extra paren
 #   err_unbal_cont   - answer the Nth status with an error, the extra paren on a continuation line
+#   extra_dimension  - return a nested select for a one-dimensional array
 #   garbage_assume   - answer the unsat assumptions with a non-S-expression word
 #   garbage_at       - replace every Nth model reply with a non-S-expression line
 #   garbage_model    - replace the Nth model reply with a partly valid one
