@@ -20,7 +20,7 @@ test.compile()
 runs = [
     ('bad_base', 1, 15),  # a base character that is not b, o, x or h
     ('bad_digits', 1, 15),  # digits outside the stated base are not a number
-    ('bad_index', 1, 15),  # a malformed array select index
+    ('bad_index', 1, 15),  # invalid hex digits in a correctly sized array index
     ('bad_value', 1, 15),  # a value with no base must not commit the earlier one
     ('bare_hash', 1, 15),  # a value that is only "#"
     ('binary', 1, 16),  # binary values
@@ -29,6 +29,7 @@ runs = [
     ('crlf', 1, 16),  # CRLF line endings
     ('diversity_model', 2, 16),  # a diversity round answers with an unusable value
     ('dup_index', 1, 15),  # the same select answered in hex and binary
+    ('extra_dimension', 1, 15),  # a nested select on a one-dimensional queue
     ('dup_model', 1, 15),  # the same variable answered twice
     ('err_assume', 1, 16),  # error in place of the unsat assumptions
     ('err_core', 1, 16),  # error in place of the unsat core

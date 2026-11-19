@@ -13,7 +13,7 @@
 # TAMPER: bad_base | bad_digits | bad_index | bad_value | bare_hash | binary
 #         | binary_literals | core_junk | crlf | die_at | die_status_at | diversity_model
 #         | dup_index | dup_model | err_assume | err_core | err_multiline | err_once
-#         | err_phase | err_reply | err_trunc | err_unbal | err_unbal_cont
+#         | extra_dimension | err_phase | err_reply | err_trunc | err_unbal | err_unbal_cont
 #         | garbage_assume | garbage_at | garbage_model | garbage_status
 #         | high_digit | indent | low_digit | model_trunc | multiline | mute_at
 #         | no_digits | none | octal | oor_assume | phase_model | phase_trunc
@@ -37,6 +37,7 @@
 #   err_core         - replace the first unsat-core reply with (error ...)
 #   err_multiline    - answer the Nth status with an (error ...) split over two lines
 #   err_once         - answer the Nth status with one (error ...) line
+#   extra_dimension  - return a nested select for a one-dimensional array
 #   err_phase        - replace the first phase value reply with (error ...)
 #   err_reply        - replace the Nth S-expression reply with (error ...)
 #   err_trunc        - answer the Nth status with an unterminated (error and close the pipe
@@ -94,7 +95,7 @@ STATUS_MODES = ("die_status_at", "err_multiline", "err_once", "err_trunc", "err_
 # Modes acting on the TAMPER_AT'th S-expression reply of any kind
 REPLY_MODES = ("err_reply", )
 # Modes acting on an array model reply, which arrives as (select ...) terms
-SELECT_MODES = ("bad_index", "diversity_model", "dup_index", "short_index", "unknown_index")
+SELECT_MODES = ("bad_index", "diversity_model", "dup_index", "extra_dimension", "short_index", "unknown_index")
 # Modes acting on the status the solver sends after answering unsat
 RECHECK_MODES = ("unsat_recheck", )
 # phase_model acts on the final phased model; the others on any phase value reply
@@ -225,7 +226,12 @@ for line in proc.stdout:
         swallow(line)
         continue
     if mode == "bad_index":
-        emit("(((select q #xgg) #x15) ((select q #x00000001) #x15)"
+        emit("(((select q #x000000gg) #x15) ((select q #x00000001) #x15)"
+             " ((select q #x00000002) #x15))")
+        swallow(line)
+        continue
+    if mode == "extra_dimension":
+        emit("(((select q #x00000000) #x15) ((select (select q #x00000001) #x00000000) #x15)"
              " ((select q #x00000002) #x15))")
         swallow(line)
         continue
