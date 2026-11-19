@@ -30,6 +30,7 @@
 #include <sstream>
 #include <streambuf>
 #include <tuple>
+#include <unordered_map>
 
 // Diversity (scalar rand vars): tie each free bit to a random target via a
 //   boolean assumption literal, then force the bits with (check-sat-assuming).

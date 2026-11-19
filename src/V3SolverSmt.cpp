@@ -1190,7 +1190,8 @@ class ConstraintExprVisitor final : public VNVisitor {
     void visit(AstNodeVarRef* nodep) override {
         AstVar* varp = nodep->varp();
         AstNodeDType* const dtypep = varp->dtypep()->skipRefp();
-        if (VN_IS(dtypep, DynArrayDType) || VN_IS(dtypep, QueueDType)) {
+        if (VN_IS(dtypep, DynArrayDType) || VN_IS(dtypep, QueueDType)
+            || VN_IS(dtypep, AssocArrayDType)) {
             bool isSizeRef = false;
             if (AstCMethodHard* const methodp = VN_CAST(nodep->backp(), CMethodHard)) {
                 if (methodp->method() == VCMethod::ASSOC_SIZE
@@ -4052,6 +4053,8 @@ class SolverSmtLowering final : public V3SolverLowering {
             new AstVarRef{fl, VN_CAST(genp->user2p(), NodeModule), genp, VAccess::READWRITE});
         std::string names;
         for (const AstVar* const varp : arrays) {
+            // Associative keys already exist and must remain available to the size solve.
+            if (VN_IS(varp->dtypep()->skipRefp(), AssocArrayDType)) continue;
             if (!names.empty()) names += ", ";
             names += "\"" + varp->name() + "\"";
         }
@@ -4071,6 +4074,9 @@ class SolverSmtLowering final : public V3SolverLowering {
         // A disabled array keeps its current size. Pin its size proxy before solving so
         // an incompatible size constraint fails instead of resizing the frozen array.
         for (AstVar* const arrVarp : sizeArrayVars) {
+            if (VN_IS(arrVarp->dtypep()->skipRefp(), AssocArrayDType)) {
+                addArrayElemRefresh(fl, arrVarp, randomizep, genp);
+            }
             addFrozenSizePin(fl, arrVarp, randomizep, genp, randModeVarp);
         }
         randomizep->addStmtsp(new AstAssign{fl, new AstVarRef{fl, sizeOkVarp, VAccess::WRITE},
