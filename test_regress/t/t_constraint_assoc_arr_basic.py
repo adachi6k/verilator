@@ -18,4 +18,10 @@ test.compile()
 
 test.execute()
 
+# Exercise every key width and nested select with binary solver replies.
+if test.vlt:
+    test.execute(logfile=test.obj_dir + '/sim_binary.log',
+                 run_env='VERILATOR_SOLVER="' + test.t_dir +
+                 '/randomize_solver_tamper.py" TAMPER=binary_literals')
+
 test.passes()
