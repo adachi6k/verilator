@@ -25,6 +25,7 @@ endclass
 
 class ClsC;
   bit enable_c;
+  bit [1:0] limit = 3;
   rand ClsB member_c[int];
 
   // Nested member access through the foreach iterator. The registration of the
@@ -56,7 +57,7 @@ class ClsC;
   // registration also references the loop index and must stay in the loop body.
   constraint constraint_randc {
     foreach (member_c[i]) {
-      member_c[i].member_b.member_rc < 3;
+      member_c[i].member_b.member_rc < limit;
     }
   }
 
@@ -87,6 +88,24 @@ module t;
         if (obj_c.member_c[i].member_b.member_rc >= 3) $stop;
         foreach (obj_c.member_c[i].inner_b[j]) begin
           `checkd(obj_c.member_c[i].inner_b[j].member_a, 1'b1)
+        end
+      end
+    end
+    // A changed state bound starts a fresh cycle for each nested randc.
+    repeat (12) begin
+      automatic bit [2:0] seen[3];
+      obj_c.limit = 1;
+      rand_ok = obj_c.randomize();
+      `checkd(rand_ok, 1)
+      obj_c.limit = 3;
+      repeat (3) begin
+        rand_ok = obj_c.randomize();
+        `checkd(rand_ok, 1)
+        foreach (obj_c.member_c[i]) begin
+          automatic bit [1:0] value = obj_c.member_c[i].member_b.member_rc;
+          `checkd(value < 3, 1)
+          `checkd(seen[i][value], 0)
+          seen[i][value] = 1;
         end
       end
     end

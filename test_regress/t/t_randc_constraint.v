@@ -235,6 +235,25 @@ class RandcDeep;
   endfunction
 endclass
 
+class RandcWithArray;
+  randc bit [1:0] value;
+  rand bit [1:0] bridge;
+  rand bit [1:0] endpoint;
+  bit [1:0] limit = 3;
+  rand bit [3:0] data[];
+  int length;
+  constraint legal {
+    endpoint < limit;
+    bridge == endpoint;
+    value == bridge;
+    unique {data};
+    foreach (data[i]) data[i] != 0;
+  }
+  function void pre_randomize();
+    data = new[length];
+  endfunction
+endclass
+
 module t;
   RandcRange rr;
   RandcSmall rs;
@@ -265,6 +284,39 @@ module t;
 
     rd = new;
     rd.test_cyclic();
+
+    begin
+      automatic RandcWithArray item = new;
+      bit [2:0] seen;
+      int ok;
+      for (int n = 0; n < 30; ++n) begin
+        item.length = 2 + n % 2;
+        if (n % 3 == 0) seen = 0;
+        ok = item.randomize();
+        `checkd(ok, 1);
+        `checkd(item.data.size(), item.length);
+        foreach (item.data[i]) begin
+          `checkd(item.data[i] != 0, 1);
+          foreach (item.data[j]) if (j < i) `checkd(item.data[i] != item.data[j], 1);
+        end
+        `checkd(item.value, item.bridge);
+        `checkd(item.value < 3, 1);
+        `checkd(seen[item.value], 0);
+        seen[item.value] = 1;
+      end
+      // A change to a constraint connected through bridge starts a new cycle.
+      ok = item.randomize();
+      `checkd(ok, 1);
+      item.limit = 2;
+      seen = 0;
+      repeat (2) begin
+        ok = item.randomize();
+        `checkd(ok, 1);
+        `checkd(item.value < 2, 1);
+        `checkd(seen[item.value], 0);
+        seen[item.value] = 1;
+      end
+    end
 
     $write("*-* All Finished *-*\n");
     $finish();

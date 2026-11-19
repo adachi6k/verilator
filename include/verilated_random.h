@@ -31,6 +31,7 @@
 #include <initializer_list>
 #include <iomanip>
 #include <iostream>
+#include <iterator>
 #include <ostream>
 #include <set>
 #include <sstream>
@@ -56,7 +57,9 @@ public:
         , m_indices{indices}
         , m_idxWidths{idxWidths} {}
 };
-using ArrayInfoMap = std::map<std::string, std::shared_ptr<const ArrayInfo>>;
+// Keep the solver symbol separate from the flattened element ordinal (a[10] and a1[0]).
+using ArrayInfoKey = std::pair<std::string, int>;
+using ArrayInfoMap = std::map<ArrayInfoKey, std::shared_ptr<const ArrayInfo>>;
 
 class VlRandomVar VL_NOT_FINAL {
     std::string m_name;  // Variable name
@@ -88,56 +91,63 @@ public:
     // for scalars, "(select arr idx...)" for array element j). Used by BSAT
     // to query/re-assert one whole element's value, not a single bit.
     virtual void emitElement(std::ostream& s, int j) const;
-    // Emit the current runtime value as an SMT bit-vector literal (#b...).
-    // Used by randomize(null) to pin a var to its existing value.
-    virtual void emitConcreteValue(std::ostream& s) const;
+    // Emit the live scalar or element value for randomize(null) and frozen unique operands.
+    virtual void emitConcreteValue(std::ostream& s, int idx = 0) const;
     virtual int totalWidth() const;
     mutable std::shared_ptr<const ArrayInfoMap> m_arrVarsRefp;
     void setArrayInfo(const std::shared_ptr<const ArrayInfoMap>& arrVarsRefp) const {
         m_arrVarsRefp = arrVarsRefp;
     }
-    mutable std::map<std::string, int> count_cache;
-    void clearCountCache() const { count_cache.clear(); }
     int countMatchingElements(const ArrayInfoMap& arr_vars, const std::string& base_name) const {
-        if (VL_LIKELY(count_cache.find(base_name) != count_cache.end()))
-            return count_cache[base_name];
-        int count = 0;
-        for (int index = 0; arr_vars.find(base_name + std::to_string(index)) != arr_vars.end();
-             ++index) {
-            ++count;
-        }
-        count_cache[base_name] = count;
-        return count;
+        // Ordinals for a symbol are dense from zero. Inline generators and object copies
+        // can share this descriptor, so use the table of the solver performing the lookup.
+        const auto end = arr_vars.upper_bound({base_name, std::numeric_limits<int>::max()});
+        if (end == arr_vars.begin()) return 0;
+        const ArrayInfoKey& key = std::prev(end)->first;
+        return key.first == base_name ? key.second + 1 : 0;
     }
     bool hasMatchingElements(const ArrayInfoMap& arr_vars, const std::string& base_name) const {
-        return arr_vars.find(base_name + "0") != arr_vars.end();
+        return arr_vars.find({base_name, 0}) != arr_vars.end();
     }
 };
-// SMT key width per associative-array level (string = 128, integral = 8 * sizeof).
+// SMT index widths are properties of the declared type, including empty dimensions.
 template <typename T>
-struct VlRandomAssocKeyWidths final {
+struct VlRandomIndexWidths final {
     static void push(std::vector<size_t>&) {}
 };
-template <typename T_Key, typename T_Value>
-struct VlRandomAssocKeyWidths<VlAssocArray<T_Key, T_Value>> final {
+template <typename T, size_t N>
+struct VlRandomIndexWidths<VlQueue<T, N>> final {
     static void push(std::vector<size_t>& widths) {
-        widths.push_back(std::is_same<T_Key, std::string>::value ? 128 : sizeof(T_Key) * 8);
-        VlRandomAssocKeyWidths<T_Value>::push(widths);
+        widths.push_back(32);
+        VlRandomIndexWidths<T>::push(widths);
+    }
+};
+template <typename T, size_t N>
+struct VlRandomIndexWidths<VlUnpacked<T, N>> final {
+    static void push(std::vector<size_t>& widths) {
+        widths.push_back(32);
+        VlRandomIndexWidths<T>::push(widths);
+    }
+};
+template <typename K, typename V>
+struct VlRandomIndexWidths<VlAssocArray<K, V>> final {
+    static void push(std::vector<size_t>& widths) {
+        widths.push_back(std::is_same<K, std::string>::value ? 128 : sizeof(K) * 8);
+        VlRandomIndexWidths<V>::push(widths);
     }
 };
 template <typename T>
 class VlRandomArrayVarTemplate final : public VlRandomVar {
-    // Static key widths per level for the empty-array declaration fallback
-    const std::vector<size_t> m_fallbackIdxWidths;
+    std::vector<size_t> m_idxWidths;  // Declared key width of each unpacked dimension
 
 public:
     VlRandomArrayVarTemplate(const std::string& name, int width, void* datap, int dimension,
-                             std::uint32_t randModeIdx, const std::vector<size_t>& idxWidths = {})
-        : VlRandomVar{name, width, datap, dimension, randModeIdx}
-        , m_fallbackIdxWidths{idxWidths} {}
+                             std::uint32_t randModeIdx)
+        : VlRandomVar{name, width, datap, dimension, randModeIdx} {
+        VlRandomIndexWidths<T>::push(m_idxWidths);
+    }
     void* datap(int idx) const override {
-        const std::string indexed_name = name() + std::to_string(idx);
-        const auto it = m_arrVarsRefp->find(indexed_name);
+        const auto it = m_arrVarsRefp->find({name(), idx});
         if (VL_LIKELY(it != m_arrVarsRefp->end())) return it->second->m_datap;
         VL_FATAL_MT(__FILE__, __LINE__, "randomize", "indexed_name not found in m_arr_vars");
         return nullptr;  // LCOV_EXCL_BR_LINE
@@ -173,8 +183,7 @@ public:
     void emitGetValue(std::ostream& s) const override {
         const int elementCounts = countMatchingElements(*m_arrVarsRefp, name());
         for (int i = 0; i < elementCounts; ++i) {
-            const std::string indexed_name = name() + std::to_string(i);
-            const auto it = m_arrVarsRefp->find(indexed_name);
+            const auto it = m_arrVarsRefp->find({name(), i});
             if (it != m_arrVarsRefp->end()) {
                 const std::vector<IData>& indices = it->second->m_indices;
                 const std::vector<size_t>& idxWidths = it->second->m_idxWidths;
@@ -186,41 +195,17 @@ public:
         }
     }
     void emitType(std::ostream& s) const override {
-        const std::string indexed_name = name() + std::to_string(0);
-        const auto it = m_arrVarsRefp->find(indexed_name);
-        if (it != m_arrVarsRefp->end()) {
-            const std::vector<size_t>& idxWidths = it->second->m_idxWidths;
-            if (dimension() > 0) {
-                for (int i = 0; i < dimension(); ++i) {
-                    s << "(Array (_ BitVec " << idxWidths[i] << ") ";
-                }
-                s << "(_ BitVec " << width() << ")";
-                for (int i = 0; i < dimension(); ++i) s << ")";
-            }
-        } else {
-            if (dimension() > 0) {
-                // Empty array: declare from the static key widths, not a 32-bit default.
-                for (int i = 0; i < dimension(); ++i) {
-                    const size_t idxWidth = i < static_cast<int>(m_fallbackIdxWidths.size())
-                                                ? m_fallbackIdxWidths[i]
-                                                : 32;
-                    s << "(Array (_ BitVec " << idxWidth << ") ";
-                }
-                s << "(_ BitVec " << width() << ")";
-                for (int i = 0; i < dimension(); ++i) s << ")";
-            } else {
-                VL_FATAL_MT(__FILE__, __LINE__, "randomize",
-                            "indexed_name not found in m_arr_vars");
-            }
-        }
+        for (int i = 0; i < dimension(); ++i)
+            s << "(Array (_ BitVec " << m_idxWidths.at(i) << ") ";
+        s << "(_ BitVec " << width() << ")";
+        for (int i = 0; i < dimension(); ++i) s << ')';
     }
     int totalWidth() const override {
         const int elementCounts = countMatchingElements(*m_arrVarsRefp, name());
         return width() * elementCounts;
     }
     void emitElement(std::ostream& s, int j) const override {
-        const std::string indexed_name = name() + std::to_string(j);
-        const auto it = m_arrVarsRefp->find(indexed_name);
+        const auto it = m_arrVarsRefp->find({name(), j});
         // Callers take j from totalWidth(), which counts these same keys, so the element
         // should always be there
         if (VL_UNCOVERABLE(it == m_arrVarsRefp->end())) {
@@ -236,8 +221,7 @@ public:
         const int j = i / width();
         i = i % width();
         s << " ((_ extract " << i << ' ' << i << ')';
-        const std::string indexed_name = name() + std::to_string(j);
-        const auto it = m_arrVarsRefp->find(indexed_name);
+        const auto it = m_arrVarsRefp->find({name(), j});
         if (it != m_arrVarsRefp->end()) {
             const std::vector<IData>& indices = it->second->m_indices;
             const std::vector<size_t>& idxWidths = it->second->m_idxWidths;
@@ -263,7 +247,11 @@ class VlRandomizer VL_NOT_FINAL {
     std::vector<size_t> m_constraintVarEnds;
     std::vector<std::string>
         m_constraints_line;  // fileline content of the constraint for unsat constraints
-    std::vector<std::string> m_softConstraints;  // Soft constraints
+    struct SoftConstraint final {
+        std::string expr;
+        std::vector<const char*> vars;
+    };
+    std::vector<SoftConstraint> m_softConstraints;
     std::map<std::string, std::shared_ptr<const VlRandomVar>> m_vars;  // Solver-dependent
     // Scratch buffer for randomConstraint(), reused across calls
     std::vector<const VlRandomVar*> m_randomConstraintVars;
@@ -272,14 +260,19 @@ class VlRandomizer VL_NOT_FINAL {
     ArrayInfoMap m_arr_vars;  // Tracks each element in array structures for iteration
     // Arrays whose elements must be distinct grouped by unique constraint
     std::map<uint32_t, std::unordered_set<std::string>> m_uniqueArrays;
+    using SizeBound = std::pair<const char*, const char*>;  // Array name and size proxy
+    std::map<uint32_t, std::vector<SizeBound>> m_uniqueBounds;
     const VlQueue<CData>* m_randmodep = nullptr;  // rand_mode state;
     const VlQueue<CData>* m_static_randmodep = nullptr;  // Static rand_mode state (shared)
     std::unordered_set<std::string> m_staticVars;  // Names of static rand vars
     int m_index = 0;  // Internal counter for key generation
     std::set<std::string> m_randcVarNames;  // Names of randc variables for cyclic tracking
-    std::map<std::string, std::set<uint64_t>>
+    std::vector<const char*> m_sizeArrays;  // Direct containers resized by this solve
+    std::set<std::pair<std::string, std::string>> m_randcAliases;  // Runtime and source names
+    using RandcHistory = std::map<std::string, std::map<std::string, std::set<uint64_t>>>;
+    RandcHistory
         m_randcUsedValues;  // Previously used values per randc var (exclusion-based cycling)
-    size_t m_randcConstraintHash = 0;  // Hash of constraints when history was valid
+    std::map<std::string, size_t> m_randcConstraintHashes;  // Per-variable cycle domains
     std::vector<std::pair<std::string, std::string>>
         m_solveBefore;  // Solve-before ordering pairs (beforeVar, afterVar)
     bool m_checkOnly = false;  // Set for randomize(null)
@@ -315,11 +308,15 @@ class VlRandomizer VL_NOT_FINAL {
     size_t hashConstraints(const std::vector<std::string>& extras) const;
     bool nextRandomize(VlRNGReseeds& rngr, bool checkOnly);
     // "(distinct ...)" expression per unique-constrained array
-    std::vector<std::string> buildUniqueExprs() const;
+    std::vector<std::string> buildUniqueExprs(std::vector<uint32_t>& groupIds) const;
+    void updateRandcHistory(const std::vector<uint32_t>& groupIds,
+                            const std::vector<std::string>& uniqueExprs, RandcHistory& changed,
+                            std::map<std::string, size_t>& newHashes);
     void emitDefines(std::ostream& os) const;
     void emitDeclares(std::ostream& os, bool pinCurrent) const;
     void emitAsserts(std::ostream& os, const std::vector<std::string>& extras, bool named) const;
-    bool nextFlat(VlRNG& rngr, VlSolverSession& sess, const std::vector<std::string>& uniqueExprs);
+    bool nextFlat(VlRNG& rngr, VlSolverSession& sess, const std::vector<std::string>& uniqueExprs,
+                  RandcHistory& exhausted);
 
     // --- UniGen2 (a near-uniform constrained randomization sampler) fields ---
     // Implementation based on the following paper:
@@ -368,7 +365,7 @@ class VlRandomizer VL_NOT_FINAL {
     bool buildSolveLayers(std::vector<std::vector<std::string>>& layersr);
     const char* phasedLogic() const;
     bool nextPhased(VlRNG& rngr, VlSolverSession& sess,
-                    const std::vector<std::string>& uniqueExprs);
+                    const std::vector<std::string>& uniqueExprs, RandcHistory& exhausted);
     bool solvePhases(VlRNG& rngr, VlSolverSession& sess,
                      const std::vector<std::vector<std::string>>& layers,
                      const std::vector<std::string>& uniqueExprs, bool& exhaustedr);
@@ -386,6 +383,14 @@ public:
     // METHODS
     // Finds the next solution satisfying the constraints
     bool next(VlRNGReseeds& rngr);
+    void setSizeArrays(std::initializer_list<const char*> names) { m_sizeArrays = names; }
+    std::string guardSize(const char* arrayp, const char* sizep, uint32_t index,
+                          std::string term) const;
+    bool nextSize(VlRNGReseeds& rngr) {
+        // The final solve rebinds these containers after their new sizes are known.
+        for (const char* namep : m_sizeArrays) clear_arr_table(namep);
+        return next(rngr);
+    }
     // Validate the constraints against the current runtime values of every
     // registered rand variable without picking new ones.
     bool next_check_only(VlRNGReseeds& rngr);
@@ -526,7 +531,6 @@ public:
             m_index = 0;
             clear_arr_table(name);
             record_arr_table(var, name, dimension, {}, {});
-            m_vars[name]->clearCountCache();
         }
     }
 
@@ -553,7 +557,6 @@ public:
             m_index = 0;
             clear_arr_table(name);
             record_arr_table(var, name, dimension, {}, {});
-            m_vars[name]->clearCountCache();
         }
     }
     // Register unpacked array of structs
@@ -570,17 +573,14 @@ public:
     write_var(VlAssocArray<T_Key, T_Value>& var, int width, const char* name, int dimension,
               std::uint32_t randmodeIdx = std::numeric_limits<std::uint32_t>::max()) {
         if (m_vars.find(name) == m_vars.end()) {
-            std::vector<size_t> keyWidths;
-            VlRandomAssocKeyWidths<VlAssocArray<T_Key, T_Value>>::push(keyWidths);
             m_vars[name]
                 = std::make_shared<const VlRandomArrayVarTemplate<VlAssocArray<T_Key, T_Value>>>(
-                    name, width, &var, dimension, randmodeIdx, keyWidths);
+                    name, width, &var, dimension, randmodeIdx);
         }
         if (dimension > 0) {
             m_index = 0;
             clear_arr_table(name);
             record_arr_table(var, name, dimension, {}, {});
-            m_vars[name]->clearCountCache();
         }
     }
 
@@ -599,7 +599,7 @@ public:
     typename std::enable_if<!std::is_class<T>::value || VlIsVlWide<T>::value, void>::type
     record_arr_table(T& var, const std::string& name, int /*dimension*/,
                      std::vector<IData> indices, std::vector<size_t> idxWidths) {
-        const std::string key = generateKey(name, m_index);
+        const ArrayInfoKey key = generateKey(name, m_index);
         m_arr_vars[key] = std::make_shared<ArrayInfo>(name, &var, m_index, indices, idxWidths);
         ++m_index;
     }
@@ -607,7 +607,7 @@ public:
     template <typename T>
     typename std::enable_if<!std::is_class<T>::value || VlIsVlWide<T>::value, void>::type
     update_arr_table(T& var, const std::string& name, int /*dimension*/) {
-        const std::string key = generateKey(name, m_index++);
+        const ArrayInfoKey key = generateKey(name, m_index++);
         const auto it = m_arr_vars.find(key);
         assert(it != m_arr_vars.end());
         const ArrayInfo& arrayInfo = *it->second;
@@ -618,8 +618,10 @@ public:
     // This is the "Sender" API for the generated code.
     // The elements to make distinct are taken from the array element table at
     // solve time, so a container resized by the solver is handled correctly.
-    void rand_unique(const std::string& name, const uint32_t key) {
+    void rand_unique(const std::string& name, const uint32_t key,
+                     std::initializer_list<SizeBound> bounds = {}) {
         m_uniqueArrays[key].insert(name);
+        if (bounds.size() && !m_sizeArrays.empty()) m_uniqueBounds.emplace(key, bounds);
     }
 
     // Recursively record all elements in an unpacked array
@@ -877,7 +879,8 @@ public:
         it->second = std::make_shared<const VlRandomArrayVarTemplate<VlQueue<T, N_MaxSize>>>(
             name, it->second->width(), &var, dimension, it->second->randModeIdx());
         m_index = 0;
-        update_arr_table(var, name, dimension);
+        clear_arr_table(name);
+        record_arr_table(var, name, dimension, {}, {});
     }
 
     template <typename T, size_t N_MaxSize>
@@ -910,13 +913,12 @@ public:
         auto it = m_vars.find(name);
         assert(it != m_vars.end());
         const int dimension = it->second->dimension();
-        std::vector<size_t> keyWidths;
-        VlRandomAssocKeyWidths<VlAssocArray<T_Key, T_Value>>::push(keyWidths);
         it->second
             = std::make_shared<const VlRandomArrayVarTemplate<VlAssocArray<T_Key, T_Value>>>(
-                name, it->second->width(), &var, dimension, it->second->randModeIdx(), keyWidths);
+                name, it->second->width(), &var, dimension, it->second->randModeIdx());
         m_index = 0;
-        update_arr_table(var, name, dimension);
+        clear_arr_table(name);
+        record_arr_table(var, name, dimension, {}, {});
     }
 
     template <typename T_Key, typename T_Value>
@@ -926,21 +928,15 @@ public:
     }
 
     // Helper: Generate unique variable key from name and index
-    static std::string generateKey(const std::string& name, int idx) {
-        if (!name.empty() && name[0] == '\\') {
-            const size_t space_pos = name.find(' ');
-            return (space_pos != std::string::npos ? name.substr(0, space_pos) : name)
-                   + std::to_string(idx);
-        }
-        const size_t bracket_pos = name.find('[');
-        return (bracket_pos != std::string::npos ? name.substr(0, bracket_pos) : name)
-               + std::to_string(idx);
+    static ArrayInfoKey generateKey(const std::string& name, int idx) {
+        const char delimiter = !name.empty() && name.front() == '\\' ? ' ' : '[';
+        return {name.substr(0, name.find(delimiter)), idx};
     }
 
     // Helper: Clear existing array element entries for a base name
     void clear_arr_table(const std::string& name) {
         for (int index = 0;; ++index) {
-            const std::string key = generateKey(name, index);
+            const ArrayInfoKey key = generateKey(name, index);
             const auto it = m_arr_vars.find(key);
             if (it == m_arr_vars.end()) break;
             m_arr_vars.erase(it);
@@ -952,7 +948,7 @@ public:
     void hard(std::string constraint, std::initializer_list<const char*> varNames = {},
               const char* filename = "", uint32_t linenum = 0, const char* source = "");
     void soft(std::string constraint, const char* filename = "", uint32_t linenum = 0,
-              const char* source = "");
+              const char* source = "", std::initializer_list<const char*> varNames = {});
     // name is kept without copying until clearConstraints(), like hard()'s varNames, so it
     // must live that long (the generated code passes literals)
     void pin_var(const char* name, int width, uint64_t value) {
@@ -963,7 +959,8 @@ public:
     void disable_soft(const std::string& varName);
     void clearConstraints();
     void clearAll();  // Clear both constraints and variables
-    void markRandc(const std::string& name);  // Mark variable as randc for cyclic tracking
+    void markRandc(const std::string& name,
+                   const char* aliasp = nullptr);  // Mark variable as randc for cyclic tracking
     void solveBefore(const std::string& beforeName,
                      const std::string& afterName);  // Register solve-before ordering
     void set_randmode(const VlQueue<CData>& randmode) { m_randmodep = &randmode; }
