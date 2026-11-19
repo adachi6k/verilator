@@ -395,7 +395,7 @@ module t;
                 if ((SUB_B !== 2'h1)) begin
                     begin
                         $write("%%Error: %s:%0d:  got=%0d exp=%0d\n", "t/t_debug_emitv.v", 
-                               32'sh191, SUB_B, 2'h1);
+                               32'sh197, SUB_B, 2'h1);
                         $stop;
                     end
                 end
@@ -1574,6 +1574,11 @@ module t;
         ONE = 3'h1
     } __Venum_ha0f45658__0;
 endmodule
+class MarkedEntry;
+    bit marked;
+    function new;
+    endfunction
+endclass
 class Cls;
     bit cg_clk;
     int member;
@@ -1584,7 +1589,12 @@ class Cls;
     rand int rmember2;
     randc bit [1:0]  rcmember;
     rand int rarray[0:2];
+    MarkedEntry entries[0:2];
 
+    ???? // CONSTRAINT 'state_field'
+
+    ???? // CONSTRAINTEXPR
+    (entries[rmember1]).marked
     ???? // CONSTRAINT 'array_values'
 
     ???? // CONSTRAINTBEFORE

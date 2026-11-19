@@ -4,4 +4,12 @@
       |                                ^
                    ... For warning description see https://verilator.org/warn/SELRANGE?v=latest
                    ... Use "/* verilator lint_off SELRANGE */" and lint_on around source to disable this message.
+%Warning-SELRANGE: t/t_select_bad_range3.v:29:14: Selection index out of range: 7 outside 3:-6
+                                                : ... note: In instance 't'
+   29 |       entries[7].mark == mark;
+      |              ^
+%Warning-SELRANGE: t/t_select_bad_range3.v:30:14: Selection index out of range: 4294967290 outside 3:-6
+                                                : ... note: In instance 't'
+   30 |       entries[32'hffff_fffa].mark == mark;
+      |              ^
 %Error: Exiting due to

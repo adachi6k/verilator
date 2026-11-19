@@ -35,7 +35,7 @@ class LinkWithVisitor final : public VNVisitor {
     const char* m_randcIllegalWhyp = nullptr;  // Why randc illegal
     AstNode* m_randcIllegalp = nullptr;  // Node causing randc illegal
     AstNodeExpr* m_currentRandomizeSelectp = nullptr;  // fromp() of current `randomize()` call
-    bool m_inRandomizeWith = false;  // If in randomize() with (and no other with afterwards)
+    const AstWith* m_randomizeWithp = nullptr;  // Enclosing randomize() lambda
 
     // VISITORS
     void visit(AstConstraint* nodep) override {
@@ -96,7 +96,7 @@ class LinkWithVisitor final : public VNVisitor {
         VL_RESTORER(m_currentRandomizeSelectp);
         if (nodep->name() == "randomize") {
             if (const AstMethodCall* const methodcallp = VN_CAST(nodep, MethodCall)) {
-                if (m_inRandomizeWith) {
+                if (m_randomizeWithp) {
                     nodep->v3warn(
                         E_UNSUPPORTED,
                         "Unsupported: randomize() nested in inline randomize() constraints");
@@ -108,14 +108,14 @@ class LinkWithVisitor final : public VNVisitor {
     }
 
     void visit(AstMemberRef* nodep) override {
-        if (m_inRandomizeWith && nodep->fromp()->sameTree(m_currentRandomizeSelectp)) {
+        if (m_randomizeWithp && nodep->fromp()->sameTree(m_currentRandomizeSelectp)) {
             // Replace member selects to the element
             // on which the randomize() is called with LambdaArgRef
             // This allows V3Randomize to work properly when
             // constrained variables are referred using that object
             AstNodeExpr* const prevFromp = nodep->fromp();
-            AstNodeExpr* const newp
-                = new AstLambdaArgRef{prevFromp->fileline(), prevFromp->name(), false};
+            AstNodeExpr* const newp = new AstLambdaArgRef{
+                prevFromp->fileline(), m_randomizeWithp->valueArgRefp()->name(), false};
             prevFromp->replaceWith(newp);
             VL_DO_DANGLING(pushDeletep(prevFromp), prevFromp);
         }
@@ -123,11 +123,9 @@ class LinkWithVisitor final : public VNVisitor {
     }
 
     void visit(AstWith* nodep) override {
-        VL_RESTORER(m_inRandomizeWith);
+        VL_RESTORER(m_randomizeWithp);
         if (const AstMethodCall* const methodCallp = VN_CAST(nodep->backp(), MethodCall)) {
-            m_inRandomizeWith = methodCallp->name() == "randomize";
-        } else {
-            m_inRandomizeWith = false;
+            if (methodCallp->name() == "randomize") m_randomizeWithp = nodep;
         }
         iterateChildren(nodep);
     }

@@ -37,6 +37,7 @@ VL_DEFINE_DEBUG_FUNCTIONS;
 // Width state, as a visitor of each AstNode
 
 class WidthSelVisitor final : public VNVisitor {
+    const bool m_constraint;
     // IMPORTANT
     //**** This is not a normal visitor, in that all iteration is instead
     //  done by the caller (V3Width).  This avoids duplicating much of the
@@ -230,11 +231,34 @@ class WidthSelVisitor final : public VNVisitor {
         UINFO(6, "  ddtypep " << ddtypep);
         if (const AstUnpackArrayDType* const adtypep = VN_CAST(ddtypep, UnpackArrayDType)) {
             // SELBIT(array, index) -> ARRAYSEL(array, index)
+            const AstNodeDType* elementDtp = adtypep->subDTypep()->skipRefp();
+            while (const AstUnpackArrayDType* const nestedp
+                   = VN_CAST(elementDtp, UnpackArrayDType))
+                elementDtp = nestedp->subDTypep()->skipRefp();
+            const bool constraintIndex = m_constraint && VN_IS(elementDtp, ClassRefDType);
             AstNodeExpr* subp = rhsp;
-            if (fromRange.lo() != 0 || fromRange.hi() < 0) {
-                subp = newSubNeg(subp, fromRange.lo());
+            if (const int lo = fromRange.lo()) {
+                if (constraintIndex) {
+                    // The offset is compared before truncation. Allow both the declared
+                    // signed bound and the original signed or unsigned index to fit.
+                    FileLine* const fl = nodep->fileline();
+                    const int width = std::max(32, rhsp->width()) + 1;
+                    AstNodeExpr* const indexp
+                        = rhsp->isSigned()
+                              ? static_cast<AstNodeExpr*>(new AstExtendS{fl, rhsp, width})
+                              : static_cast<AstNodeExpr*>(new AstExtend{fl, rhsp, width});
+                    subp = new AstSub{
+                        fl, indexp,
+                        new AstExtendS{fl, new AstConst{fl, static_cast<uint32_t>(lo)}, width}};
+                } else {
+                    subp = newSubNeg(subp, lo);
+                }
             }
             AstArraySel* const newp = new AstArraySel{nodep->fileline(), fromp, subp};
+            if (constraintIndex) {
+                newp->constraintIndexWidth(-1);  // Set by WidthVisitor
+                if (fromRange.lo() && VN_IS(rhsp, Const)) V3Const::constifyEdit(newp->bitp());
+            }
             newp->dtypeFrom(adtypep->subDTypep());  // Need to strip off array reference
             UINFOTREE(9, newp, "", "SELBTn");
             nodep->replaceWith(newp);
@@ -619,7 +643,8 @@ class WidthSelVisitor final : public VNVisitor {
 
 public:
     // CONSTRUCTORS
-    WidthSelVisitor() = default;
+    explicit WidthSelVisitor(bool constraint)
+        : m_constraint{constraint} {}
     ~WidthSelVisitor() override = default;
     AstNode* mainAcceptEdit(AstNode* nodep) { return iterateSubtreeReturnEdits(nodep); }
 };
@@ -627,9 +652,9 @@ public:
 //######################################################################
 // Width class functions
 
-AstNode* V3Width::widthSelNoIterEdit(AstNode* nodep) {
+AstNode* V3Width::widthSelNoIterEdit(AstNode* nodep, bool constraint) {
     UINFO(4, __FUNCTION__ << ": " << nodep);
-    WidthSelVisitor visitor;
+    WidthSelVisitor visitor{constraint};
     nodep = visitor.mainAcceptEdit(nodep);
     return nodep;
 }

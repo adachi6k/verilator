@@ -4106,6 +4106,14 @@ std::string AstScopeName::scopePrettyNameFormatter(const std::string& text) {
     if (out.substr(0, 1) == ".") out.replace(0, 1, "");
     return AstNode::prettyName(out);
 }
+void AstArraySel::dump(std::ostream& str) const {
+    Super::dump(str);
+    if (constraintIndexWidth()) str << " constraintIndexWidth=" << constraintIndexWidth();
+}
+void AstArraySel::dumpJson(std::ostream& str) const {
+    if (constraintIndexWidth()) dumpJsonNumFunc(str, constraintIndexWidth);
+    dumpJsonGen(str);
+}
 void AstSel::dump(std::ostream& str) const {
     Super::dump(str);
     str << " widthConst=" << this->widthConst();

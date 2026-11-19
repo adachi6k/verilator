@@ -4946,6 +4946,7 @@ public:
 // === AstNodeSel ===
 class AstArraySel final : public AstNodeSel {
     // @astgen makeDfgVertex
+    int m_constraintIndexWidth = 0;  // Native width deferred until constraint lowering
     void init(const AstNode* fromp) {
         if (fromp && VN_IS(fromp->dtypep()->skipRefp(), NodeArrayDType)) {
             // Strip off array to find what array references
@@ -4963,6 +4964,10 @@ public:
         init(fromp);
     }
     ASTGEN_MEMBERS_AstArraySel;
+    void dump(std::ostream& str) const override;
+    void dumpJson(std::ostream& str) const override;
+    int constraintIndexWidth() const { return m_constraintIndexWidth; }
+    void constraintIndexWidth(int width) { m_constraintIndexWidth = width; }
     void numberOperate(V3Number&, const V3Number&, const V3Number&) override { V3ERROR_NA; }
     string emitVerilog() override { return "%k(%l%f[%r])"; }
     string emitC() override { V3ERROR_NA_RETURN(""); }  // Special cased
@@ -4974,7 +4979,9 @@ public:
     bool sizeMattersRhs() const override { return false; }
     bool isGateOptimizable() const override { return true; }  // esp for V3Const::ifSameAssign
     bool isPredictOptimizable() const override { return true; }
-    bool sameNode(const AstNode* /*samep*/) const override { return true; }
+    bool sameNode(const AstNode* samep) const override {
+        return constraintIndexWidth() == VN_DBG_AS(samep, ArraySel)->constraintIndexWidth();
+    }
     int instrCount() const override { return widthInstrs(); }
 };
 class AstAssocSel final : public AstNodeSel {

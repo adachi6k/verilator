@@ -390,10 +390,11 @@ class WidthVisitor final : public VNVisitor {
     AstNodeFTask* m_ftaskp = nullptr;  // Current function/task
     AstProperty* m_propertyp = nullptr;  // Current property
     AstNodeModule* m_modep = nullptr;  // Current module
+    bool m_inStdRandArgs = false;  // Arguments matched against a std::randomize with-clause
     const AstConstraint* m_constraintp = nullptr;  // Current constraint
     AstNodeProcedure* m_procedurep = nullptr;  // Current final/always
     const AstNode* m_writerp = nullptr;  // Assign, release or driving pin whose lvalue is iterated
-    const AstWith* m_withp = nullptr;  // Current 'with' statement
+    std::vector<const AstWith*> m_withs;  // Enclosing lambdas, outermost first
     const AstFunc* m_funcp = nullptr;  // Current function
     const AstAttrOf* m_attrp = nullptr;  // Current attribute
     const AstNodeExpr* m_randomizeFromp = nullptr;  // Current randomize method call fromp
@@ -1558,11 +1559,13 @@ class WidthVisitor final : public VNVisitor {
             AstNodeDType* const selwidthDTypep = nodep->findBitOrLogicDType(
                 selwidth, selwidth, nodep->bitp()->dtypep()->numeric(),
                 nodep->bitp()->isFourstateOrNoDtype());
-            if (widthBad(nodep->bitp(), selwidthDTypep) && nodep->bitp()->width() != 32) {
-                nodep->v3widthWarn(selwidth, nodep->bitp()->width(),
+            const bool wideOffset = nodep->constraintIndexWidth() && fromlsb;
+            const int indexWidth = nodep->bitp()->width() - wideOffset;
+            if (widthBad(nodep->bitp(), selwidthDTypep) && indexWidth != 32) {
+                nodep->v3widthWarn(selwidth, indexWidth,
                                    "Bit extraction of array["
                                        << frommsb << ":" << fromlsb << "] requires " << selwidth
-                                       << " bit index, not " << nodep->bitp()->width()
+                                       << " bit index, not " << indexWidth
                                        << (nodep->bitp()->width() != nodep->bitp()->widthMin()
                                                ? " or " + cvtToStr(nodep->bitp()->widthMin())
                                                : "")
@@ -1576,25 +1579,52 @@ class WidthVisitor final : public VNVisitor {
                 // Must check bounds before adding a select that truncates the bound
                 // Note we've already subtracted off LSB
                 if (const AstConst* const constp = VN_CAST(nodep->bitp(), Const)) {
-                    const bool hasAnyXZ = constp->num().isAnyXZ();
-                    if (hasAnyXZ || constp->toSInt() > (frommsb - fromlsb)
-                        || constp->toSInt() < 0) {
+                    const V3Number& offset = constp->num();
+                    const int hi = nodep->constraintIndexWidth()
+                                       ? VN_AS(fromDtp, UnpackArrayDType)->hi()
+                                       : frommsb;
+                    const bool hasAnyXZ = offset.isAnyXZ();
+                    const auto outOfRange = [&]() {
+                        if (nodep->constraintIndexWidth()) {
+                            return !offset.fitsInUInt()
+                                   || (offset.isSigned() && offset.isNegative())
+                                   || offset.toUInt() > static_cast<uint32_t>(hi - fromlsb);
+                        }
+                        return constp->toSInt() > (hi - fromlsb) || constp->toSInt() < 0;
+                    };
+                    if (hasAnyXZ || outOfRange()) {
                         // Suppress in dead/parameterized template modules
                         if (!(m_modep && (m_modep->dead() || m_modep->parameterizedTemplate()))) {
                             std::stringstream val;
                             if (hasAnyXZ) {
-                                val << constp->num();
+                                val << offset;
+                            } else if (wideOffset) {
+                                // Undo the widened subtraction to print the source index.
+                                V3Number lower{nodep, offset.width()};
+                                lower.opExtendS(
+                                    V3Number{nodep, 32, static_cast<uint32_t>(fromlsb)}, 32);
+                                V3Number index{nodep, offset.width()};
+                                val << index.opAdd(offset, lower).toDecimalS();
+                            } else if (nodep->constraintIndexWidth()) {
+                                val << (offset.isSigned() ? offset.toDecimalS()
+                                                          : offset.toDecimalU());
                             } else {
-                                val << (constp->toSInt() + fromlsb);
+                                val << (static_cast<int64_t>(constp->toSInt()) + fromlsb);
                             }
                             nodep->v3warn(SELRANGE, "Selection index out of range: "
-                                                        << val.str() << " outside " << frommsb
-                                                        << ":" << fromlsb);
+                                                        << val.str() << " outside " << hi << ":"
+                                                        << fromlsb);
                         }
                     }
                 }
-                widthCheckSized(nodep, "Extract Range", nodep->bitp(), selwidthDTypep, EXTEND_EXP,
-                                false /*NOWARN*/);
+                // Only the randomization pass knows which fields and indices will be solved.
+                if (nodep->constraintIndexWidth() && nodep->bitp()->width() > selwidth) {
+                    nodep->constraintIndexWidth(selwidth);
+                } else {
+                    nodep->constraintIndexWidth(0);
+                    widthCheckSized(nodep, "Extract Range", nodep->bitp(), selwidthDTypep,
+                                    EXTEND_EXP, false /*NOWARN*/);
+                }
             }
         }
     }
@@ -1754,7 +1784,11 @@ class WidthVisitor final : public VNVisitor {
         userIterateAndNext(nodep->thsp(), WidthVP{CONTEXT_DET, PRELIM}.p());  // FINAL in AstSel
         // Error recovery returns this existing receiver rather than a new selection.
         AstNodeExpr* const fromp = nodep->fromp();
-        AstNode* const selp = V3Width::widthSelNoIterEdit(nodep);
+        // A function body or array lambda may later be inlined into a constraint.
+        const bool constraint
+            = v3Global.useRandomizeMethods()
+              && (m_constraintp || m_funcp || !m_withs.empty() || m_inStdRandArgs);
+        AstNode* const selp = V3Width::widthSelNoIterEdit(nodep, constraint);
         if (selp != nodep) {
             VL_DANGLING(nodep);
             if (AstCMethodHard* const methodp = VN_CAST(selp, CMethodHard)) {
@@ -9104,8 +9138,13 @@ class WidthVisitor final : public VNVisitor {
                 AstNodeDType* const adtypep = nodep->findBitDType();
                 withp = methodWithClause(nodep, false, false, adtypep->findVoidDType(),
                                          adtypep->findBitDType(), adtypep);
-                for (const AstArg* const argp : nodep->argspList()) {
-                    userIterateAndNext(argp->exprp(), WidthVP{SELF, BOTH}.p());
+                {
+                    // Preserve the same subscript expression on both sides of argument matching.
+                    VL_RESTORER(m_inStdRandArgs);
+                    m_inStdRandArgs = withp && nodep->name() == "randomize";
+                    for (const AstArg* const argp : nodep->argspList()) {
+                        userIterateAndNext(argp->exprp(), WidthVP{SELF, BOTH}.p());
+                    }
                 }
                 handleStdRandomizeArgs(nodep);  // Provided args should be in current scope
                 processFTaskRefArgs(nodep);
@@ -9288,8 +9327,7 @@ class WidthVisitor final : public VNVisitor {
         m_underCast = false;  // The lambda is checked independently of a cast of the result.
         // Should otherwise be underneath a method call
         AstNodeDType* const vdtypep = m_vup->dtypeNullSkipRefp();
-        VL_RESTORER(m_withp);
-        m_withp = nodep;
+        m_withs.push_back(nodep);
         userIterateChildren(nodep->indexArgRefp(), nullptr);
         userIterateChildren(nodep->valueArgRefp(), nullptr);
         if (!nodep->exprp()) {
@@ -9313,14 +9351,18 @@ class WidthVisitor final : public VNVisitor {
                                    nodep->dtypep());
             }
         }
+        m_withs.pop_back();
     }
     void visit(AstLambdaArgRef* nodep) override {
-        UASSERT_OBJ(m_withp, nodep, "LambdaArgRef not underneath 'with' lambda");
-        if (nodep->index()) {
-            nodep->dtypeFrom(m_withp->indexArgRefp());
-        } else {
-            nodep->dtypeFrom(m_withp->valueArgRefp());
+        for (auto it = m_withs.rbegin(); it != m_withs.rend(); ++it) {
+            const AstLambdaArgRef* const argp
+                = nodep->index() ? (*it)->indexArgRefp() : (*it)->valueArgRefp();
+            if (argp->name() == nodep->name()) {
+                nodep->dtypeFrom(argp);
+                return;
+            }
         }
+        nodep->v3fatalSrc("Lambda argument without an enclosing declaration");
     }
     void visit(AstNetlist* nodep) override {
         // Iterate modules backwards, in bottom-up order.  That's faster

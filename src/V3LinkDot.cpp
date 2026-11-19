@@ -2344,6 +2344,7 @@ class LinkDotFindVisitor final : public VNVisitor {
         VL_DO_DANGLING(nodep->deleteTree(), nodep);
     }
     void visit(AstWith* nodep) override {  // FindVisitor::
+        if (VN_IS(nodep->exprp(), NodeConstraintItem)) v3Global.useRandomizeMethods(true);
         // Symbol table needs nodep->name() as the index variable's name
         // Iteration will pickup the AstVar we made under AstWith
         VL_RESTORER(m_curSymp);
