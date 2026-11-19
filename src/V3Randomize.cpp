@@ -38,6 +38,7 @@
 #include "V3Randomize.h"
 
 #include "V3Ast.h"
+#include "V3Const.h"
 #include "V3ConstPool.h"
 #include "V3Error.h"
 #include "V3FileLine.h"
@@ -189,6 +190,19 @@ static void checkRandTypeEligibility(AstNode* contextp, AstNodeDType* dtypep, bo
 }
 
 //######################################################################
+// Restore the usual scalar subscript before naming solver variables or generating native reads.
+static void narrowConstraintIndex(AstArraySel* selp) {
+    const int width = selp->constraintIndexWidth();
+    if (width <= 0) return;
+    selp->constraintIndexWidth(0);
+    AstNodeExpr* const indexp = selp->bitp()->unlinkFrBack();
+    AstSel* const narrowp = new AstSel{selp->fileline(), indexp, 0, width};
+    narrowp->dtypeChgSigned(indexp->dtypep()->numeric());
+    narrowp->user1(indexp->user1());
+    selp->bitp(narrowp);
+    if (VN_IS(indexp, Const)) V3Const::constifyEdit(narrowp);
+}
+
 // Visitor that marks classes needing a randomize() method
 
 class RandomizeMarkVisitor final : public VNVisitor {
@@ -215,6 +229,7 @@ class RandomizeMarkVisitor final : public VNVisitor {
     AstNodeStmt* m_stmtp = nullptr;  // Current statement
     AstNodeFTaskRef* m_stdRandCallp = nullptr;  // Current std::randomize() call
     bool m_inStdWith = false;  // True when inside a 'with {}' clause
+    std::unordered_set<AstArraySel*> m_lookupSelectors;
     std::set<AstNodeVarRef*> m_staticRefs;  // References to static variables under `with` clauses
     AstWith* m_withp = nullptr;  // Current 'with' constraint node
 
@@ -759,8 +774,9 @@ class RandomizeMarkVisitor final : public VNVisitor {
         const bool randObject = nodep->fromp()->user1() || VN_IS(nodep->fromp(), LambdaArgRef);
         const bool randMember = nodep->varp()->rand().isRandomizable();
         const bool inStdWith = m_inStdWith && m_stdRandCallp;
-        if ((randObject && randMember && !inStdWith)
-            || !V3Randomize::stateMemberArraySels(nodep).empty()) {
+        const auto selectors = V3Randomize::stateMemberArraySels(nodep);
+        m_lookupSelectors.insert(selectors.begin(), selectors.end());
+        if ((randObject && randMember && !inStdWith) || !selectors.empty()) {
             nodep->user1(true);
         } else if (inStdWith && isVarInStdRandomizeArgs(nodep->varp())) {
             nodep->user1(true);
@@ -834,6 +850,9 @@ public:
         iterateConst(nodep);
         markAllDerived();
         setPackageRefs();
+        nodep->foreach([&](AstArraySel* selp) {
+            if (!m_lookupSelectors.count(selp)) narrowConstraintIndex(selp);
+        });
     }
     ~RandomizeMarkVisitor() override = default;
 };
@@ -2796,28 +2815,30 @@ public:
 //######################################################################
 // Randomize method class functions
 
-// Return symbolic selectors in declaration order when the field is reached through state.
+// A state field depends on every dimension when any index is solved. A rand handle
+// array can still contain non-rand fields, and std::randomize can freeze its root.
 std::vector<AstArraySel*> V3Randomize::stateMemberArraySels(AstMemberRef* memberp) {
     if (!memberp->dtypep()->skipRefp()->isIntegralOrPacked()
         || memberp->varp()->lifetime().isStatic())
         return {};
     std::vector<AstArraySel*> selectors;
-    bool state = false;
+    bool state = !memberp->varp()->rand().isRandomizable();
+    bool symbolic = false;
     AstNodeExpr* receiverp = memberp->fromp();
     while (true) {
         if (const AstMemberRef* const innerp = VN_CAST(receiverp, MemberRef)) {
+            state |= !innerp->varp()->rand().isRandomizable();
             receiverp = innerp->fromp();
         } else if (AstArraySel* const selp = VN_CAST(receiverp, ArraySel)) {
-            if (selp->bitp()->user1()) {
-                selectors.push_back(selp);
-                if (!selp->fromp()->user1()) state = true;
-            }
+            selectors.push_back(selp);
+            state |= !selp->fromp()->user1();
+            symbolic |= selp->bitp()->user1();
             receiverp = selp->fromp();
         } else {
             break;
         }
     }
-    if (!state) return {};
+    if (!state || !symbolic) return {};
     std::reverse(selectors.begin(), selectors.end());
     return selectors;
 }
@@ -2827,6 +2848,8 @@ void V3Randomize::randomizeNetlist(AstNetlist* nodep) {
     {
         const RandomizeMarkVisitor markVisitor{nodep};
         const RandomizeVisitor randomizeVisitor{nodep};
+        // Remaining copies, such as rand_mode fallbacks, are evaluated natively.
+        nodep->foreach([](AstArraySel* selp) { narrowConstraintIndex(selp); });
     }
     V3Global::dumpCheckGlobalTree("randomize", 0, dumpTreeEitherLevel() >= 3);
 }

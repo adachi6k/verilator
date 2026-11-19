@@ -1509,22 +1509,6 @@ class WidthVisitor final : public VNVisitor {
         }
     }
 
-    // A field of a rand object is state as soon as a non-rand handle or array is traversed.
-    static bool isStateHandleArray(AstArraySel* selp) {
-        const AstNodeDType* dtypep = selp->dtypep()->skipRefp();
-        while (const AstUnpackArrayDType* const arrayp = VN_CAST(dtypep, UnpackArrayDType))
-            dtypep = arrayp->subDTypep()->skipRefp();
-        if (!VN_IS(dtypep, ClassRefDType)) return false;
-        AstNode* ownerp = selp->fromp()->baseFromp(false);
-        while (const AstMemberRef* const memberp = VN_CAST(ownerp, MemberRef)) {
-            if (!memberp->varp()->rand().isRandomizable()) return true;
-            ownerp = memberp->fromp()->baseFromp(false);
-        }
-        if (const AstNodeVarRef* const refp = VN_CAST(ownerp, NodeVarRef)) {
-            return !refp->varp()->rand().isRandomizable();
-        }
-        return !VN_IS(ownerp, ThisRef);
-    }
     void visit(AstArraySel* nodep) override {
         // Signed/Real: Output signed iff LHS signed/real; binary operator
         // Note by contrast, bit extract selects are unsigned
@@ -1574,11 +1558,13 @@ class WidthVisitor final : public VNVisitor {
             AstNodeDType* const selwidthDTypep = nodep->findBitOrLogicDType(
                 selwidth, selwidth, nodep->bitp()->dtypep()->numeric(),
                 nodep->bitp()->isFourstateOrNoDtype());
-            if (widthBad(nodep->bitp(), selwidthDTypep) && nodep->bitp()->width() != 32) {
-                nodep->v3widthWarn(selwidth, nodep->bitp()->width(),
+            const bool wideOffset = nodep->constraintIndexWidth() && fromlsb;
+            const int indexWidth = nodep->bitp()->width() - wideOffset;
+            if (widthBad(nodep->bitp(), selwidthDTypep) && indexWidth != 32) {
+                nodep->v3widthWarn(selwidth, indexWidth,
                                    "Bit extraction of array["
                                        << frommsb << ":" << fromlsb << "] requires " << selwidth
-                                       << " bit index, not " << nodep->bitp()->width()
+                                       << " bit index, not " << indexWidth
                                        << (nodep->bitp()->width() != nodep->bitp()->widthMin()
                                                ? " or " + cvtToStr(nodep->bitp()->widthMin())
                                                : "")
@@ -1592,29 +1578,49 @@ class WidthVisitor final : public VNVisitor {
                 // Must check bounds before adding a select that truncates the bound
                 // Note we've already subtracted off LSB
                 if (const AstConst* const constp = VN_CAST(nodep->bitp(), Const)) {
-                    const bool hasAnyXZ = constp->num().isAnyXZ();
-                    if (hasAnyXZ || constp->toSInt() > (frommsb - fromlsb)
-                        || constp->toSInt() < 0) {
+                    const V3Number& offset = constp->num();
+                    const int hi = nodep->constraintIndexWidth()
+                                       ? VN_AS(fromDtp, UnpackArrayDType)->hi()
+                                       : frommsb;
+                    const bool hasAnyXZ = offset.isAnyXZ();
+                    const auto outOfRange = [&]() {
+                        if (nodep->constraintIndexWidth()) {
+                            return !offset.fitsInUInt()
+                                   || (offset.isSigned() && offset.isNegative())
+                                   || offset.toUInt() > static_cast<uint32_t>(hi - fromlsb);
+                        }
+                        return constp->toSInt() > (hi - fromlsb) || constp->toSInt() < 0;
+                    };
+                    if (hasAnyXZ || outOfRange()) {
                         // Suppress in dead/parameterized template modules
                         if (!(m_modep && (m_modep->dead() || m_modep->parameterizedTemplate()))) {
                             std::stringstream val;
                             if (hasAnyXZ) {
-                                val << constp->num();
+                                val << offset;
+                            } else if (wideOffset) {
+                                // Undo the widened subtraction to print the source index.
+                                V3Number lower{nodep, offset.width()};
+                                lower.opExtendS(
+                                    V3Number{nodep, 32, static_cast<uint32_t>(fromlsb)}, 32);
+                                V3Number index{nodep, offset.width()};
+                                val << index.opAdd(offset, lower).toDecimalS();
+                            } else if (nodep->constraintIndexWidth()) {
+                                val << (offset.isSigned() ? offset.toDecimalS()
+                                                          : offset.toDecimalU());
                             } else {
-                                val << (constp->toSInt() + fromlsb);
+                                val << (static_cast<int64_t>(constp->toSInt()) + fromlsb);
                             }
                             nodep->v3warn(SELRANGE, "Selection index out of range: "
-                                                        << val.str() << " outside " << frommsb
-                                                        << ":" << fromlsb);
+                                                        << val.str() << " outside " << hi << ":"
+                                                        << fromlsb);
                         }
                     }
                 }
-                // A symbolic class-handle index must distinguish an invalid index from its
-                // in-range low bits when the solver selects an object field.
-                const bool constraint
-                    = m_constraintp || (m_withp && VN_IS(m_withp->exprp(), NodeConstraintItem));
-                if (!constraint || nodep->bitp()->width() <= selwidth
-                    || !isStateHandleArray(nodep)) {
+                // Only the randomization pass knows which fields and indices will be solved.
+                if (nodep->constraintIndexWidth() && nodep->bitp()->width() > selwidth) {
+                    nodep->constraintIndexWidth(selwidth);
+                } else {
+                    nodep->constraintIndexWidth(0);
                     widthCheckSized(nodep, "Extract Range", nodep->bitp(), selwidthDTypep,
                                     EXTEND_EXP, false /*NOWARN*/);
                 }
@@ -1777,7 +1783,9 @@ class WidthVisitor final : public VNVisitor {
         userIterateAndNext(nodep->thsp(), WidthVP{CONTEXT_DET, PRELIM}.p());  // FINAL in AstSel
         // Error recovery returns this existing receiver rather than a new selection.
         AstNodeExpr* const fromp = nodep->fromp();
-        AstNode* const selp = V3Width::widthSelNoIterEdit(nodep);
+        const bool constraint
+            = m_constraintp || (m_withp && VN_IS(m_withp->exprp(), NodeConstraintItem));
+        AstNode* const selp = V3Width::widthSelNoIterEdit(nodep, constraint);
         if (selp != nodep) {
             VL_DANGLING(nodep);
             if (AstCMethodHard* const methodp = VN_CAST(selp, CMethodHard)) {

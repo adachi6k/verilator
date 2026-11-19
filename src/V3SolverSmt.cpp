@@ -192,8 +192,10 @@ class ConstraintExprVisitor final : public VNVisitor {
         std::string name;
         AstNodeExpr* tablep;
         AstNodeExpr* validp;
+        std::string zero;
     };
     std::vector<StateLookup> m_stateLookups;
+    bool m_inLookupIndex = false;
 
     class NestedAccessPath final {
         AstMemberRef* m_topNestedArrayMemberRefp
@@ -527,12 +529,90 @@ class ConstraintExprVisitor final : public VNVisitor {
         return new AstSFormatF{nodep->fileline(), (nodep->width() & 3) ? "#b%b" : "#x%x", false,
                                nodep};
     }
+    static std::string missingStateValue(int width) {
+        return "(_ bv0 " + cvtToStr(width + 1) + ")";
+    }
+    AstNodeExpr* bindStateValuep(FileLine* fl, int width, AstNodeExpr* tablep) {
+        const std::string name = "|" + m_uniqueNames.get("state lookup") + "|";
+        const std::string top = cvtToStr(width);
+        m_stateLookups.push_back(
+            {name, tablep,
+             new AstSFormatF{fl, "((_ extract " + top + " " + top + ") " + name + ")", false,
+                             nullptr},
+             missingStateValue(width)});
+        return new AstSFormatF{fl, "((_ extract " + cvtToStr(width - 1) + " 0) " + name + ")",
+                               false, nullptr};
+    }
+    static AstNodeExpr* bothPresentp(FileLine* fl, AstNodeExpr* leftp, AstNodeExpr* rightp) {
+        if (!leftp) return rightp;
+        if (!rightp) return leftp;
+        return new AstLogAnd{fl, leftp, rightp};
+    }
+    // Native SMT arguments are formatted before the solver chooses a branch. Check only
+    // receivers evaluated by the SV expression, in their original short-circuit order.
+    static AstNodeExpr* stateReadValidp(AstNode* nodep) {
+        FileLine* const fl = nodep->fileline();
+        AstNodeExpr* condp = nullptr;
+        AstNodeExpr* thenp = nullptr;
+        AstNodeExpr* elsep = nullptr;
+        if (AstCond* const cp = VN_CAST(nodep, Cond)) {
+            condp = cp->condp();
+            thenp = cp->thenp();
+            elsep = cp->elsep();
+        } else if (VN_IS(nodep, LogAnd) || VN_IS(nodep, LogIf) || VN_IS(nodep, LogOr)) {
+            AstNodeBiop* const bp = VN_AS(nodep, NodeBiop);
+            condp = bp->lhsp();
+            if (VN_IS(nodep, LogOr))
+                elsep = bp->rhsp();
+            else
+                thenp = bp->rhsp();
+        }
+        if (condp) {
+            AstNodeExpr* const predValidp = stateReadValidp(condp);
+            AstNodeExpr* const tvalidp = thenp ? stateReadValidp(thenp) : nullptr;
+            AstNodeExpr* const evalidp = elsep ? stateReadValidp(elsep) : nullptr;
+            if (!tvalidp && !evalidp) return predValidp;
+            return bothPresentp(
+                fl, predValidp,
+                new AstCond{fl, condp->cloneTreePure(false),
+                            tvalidp ? tvalidp : new AstConst{fl, AstConst::BitTrue{}},
+                            evalidp ? evalidp : new AstConst{fl, AstConst::BitTrue{}}});
+        }
+        AstNodeExpr* validp = nullptr;
+        for (AstNode* childp : {nodep->op1p(), nodep->op2p(), nodep->op3p(), nodep->op4p()}) {
+            for (; childp; childp = childp->nextp())
+                validp = bothPresentp(fl, validp, stateReadValidp(childp));
+        }
+        if (const AstMemberRef* const memberp = VN_CAST(nodep, MemberRef)) {
+            if (!memberp->varp()->lifetime().isStatic()) {
+                validp = bothPresentp(fl, validp,
+                                      new AstNeq{fl, memberp->fromp()->cloneTreePure(false),
+                                                 new AstConst{fl, AstConst::Null{}}});
+            }
+        }
+        return validp;
+    }
+    bool useNativeGuard(AstNodeExpr* condp) const {
+        return !condp->user1() && (!m_inLookupIndex || !condp->exists([](const AstMemberRef* p) {
+            return !p->varp()->lifetime().isStatic();
+        }));
+    }
     bool editFormat(AstNodeExpr* nodep) {
         if (nodep->user1()) return false;
         // Replace computable expression with SMT constant
+        FileLine* const fl = nodep->fileline();
+        const int width = nodep->width();
+        AstNodeExpr* const validp = m_inLookupIndex ? stateReadValidp(nodep) : nullptr;
         VNRelinker handle;
         nodep->unlinkFrBack(&handle);
-        handle.relink(getConstFormat(nodep));
+        AstNodeExpr* valuep = getConstFormat(nodep);
+        if (validp) {
+            valuep = bindStateValuep(
+                fl, width,
+                new AstCond{fl, validp, new AstSFormatF{fl, "(concat #b1 %s)", false, valuep},
+                            new AstConst{fl, AstConst::String{}, missingStateValue(width)}});
+        }
+        handle.relink(valuep);
         return true;
     }
     AstNodeExpr* wrapWithCond(AstNodeExpr* const exprp, AstNodeExpr* const condp,
@@ -546,6 +626,12 @@ class ConstraintExprVisitor final : public VNVisitor {
         return exprp;
     }
     void guardStateLookups(size_t first, size_t end, AstNodeExpr* condp, bool whenTrue) {
+        if (first == end) return;
+        // A formatted native predicate can guard table construction before calling the solver.
+        if (const AstSFormatF* const formatp = VN_CAST(condp, SFormatF)) {
+            if (formatp->name() == "#b%b" && formatp->exprsp()->width() == 1)
+                condp = formatp->exprsp();
+        }
         for (size_t i = first; i < end; ++i) {
             AstNodeExpr*& validp = m_stateLookups[i].validp;
             FileLine* const fl = condp->fileline();
@@ -553,6 +639,11 @@ class ConstraintExprVisitor final : public VNVisitor {
                 validp = new AstSFormatF{fl, whenTrue ? "(bvor (bvnot %s) %s)" : "(bvor %s %s)",
                                          false, AstNode::addNext(condp->cloneTree(false), validp)};
             } else {
+                StateLookup& lookup = m_stateLookups[i];
+                AstNodeExpr* const zerop = new AstConst{fl, AstConst::String{}, lookup.zero};
+                lookup.tablep = new AstCond{fl, condp->cloneTreePure(false),
+                                            whenTrue ? lookup.tablep : zerop,
+                                            whenTrue ? zerop : lookup.tablep};
                 AstNodeExpr* const truep = new AstConst{fl, AstConst::String{}, "#b1"};
                 validp = new AstCond{fl, condp->cloneTreePure(false), whenTrue ? validp : truep,
                                      whenTrue ? truep : validp};
@@ -1743,7 +1834,7 @@ class ConstraintExprVisitor final : public VNVisitor {
     }
     void visit(AstCond* nodep) override {
         if (editFormat(nodep)) return;
-        if (!nodep->condp()->user1()) {
+        if (useNativeGuard(nodep->condp())) {
             // Do not burden the solver if cond computable: (cond ? "then" : "else")
             const size_t thenStart = m_stateLookups.size();
             iterate(nodep->thenp());
@@ -2039,7 +2130,7 @@ class ConstraintExprVisitor final : public VNVisitor {
     }
     void editStateMemberSel(AstMemberRef* nodep, const std::vector<AstArraySel*>& selectors) {
         FileLine* const fl = nodep->fileline();
-        // A tuple of all symbolic indices identifies one field, even across nested objects.
+        // The tuple of indices identifies one field, even across nested objects.
         const auto append = [fl](AstNodeExpr* tuplep, AstNodeExpr* partp) -> AstNodeExpr* {
             if (!tuplep) return partp;
             return new AstSFormatF{fl, "(concat %s %s)", false, AstNode::addNext(tuplep, partp)};
@@ -2053,7 +2144,12 @@ class ConstraintExprVisitor final : public VNVisitor {
             AstNodeExpr* const sourcep = selp->bitp()->unlinkFrBack();
             const int width = sourcep->width();
             const int keyWidth = sourcep->isSigned() ? std::max(32, width) : width;
-            AstNodeExpr* partp = VN_AS(iterateSubtreeReturnEdits(sourcep), NodeExpr);
+            AstNodeExpr* partp;
+            {
+                VL_RESTORER(m_inLookupIndex);
+                m_inLookupIndex = true;
+                partp = VN_AS(iterateSubtreeReturnEdits(sourcep), NodeExpr);
+            }
             // Keys are nonnegative offsets. Preserve the sign of a narrow negative index.
             if (width < keyWidth) {
                 partp = new AstSFormatF{
@@ -2071,30 +2167,16 @@ class ConstraintExprVisitor final : public VNVisitor {
                 offsetp = new AstSub{fl, offsetp, new AstConst{fl, static_cast<uint32_t>(lo)}};
             }
             selp->bitp(offsetp->cloneTree(false));
+            selp->constraintIndexWidth(0);
             keyp = append(keyp,
                           getConstFormat(adjustWidth(fl, offsetp, keyWidth, VSigning::UNSIGNED)));
         }
-        AstNodeExpr* presentp = nullptr;
-        AstNodeExpr* receiverp = nodep->fromp();
-        while (true) {
-            if (VN_IS(receiverp->dtypep()->skipRefp(), ClassRefDType)) {
-                AstNodeExpr* const existsp = new AstNeq{fl, receiverp->cloneTreePure(false),
-                                                        new AstConst{fl, AstConst::Null{}}};
-                presentp = presentp ? new AstLogAnd{fl, existsp, presentp} : existsp;
-            }
-            if (const AstMemberRef* const memberp = VN_CAST(receiverp, MemberRef)) {
-                receiverp = memberp->fromp();
-            } else if (const AstArraySel* const arrayp = VN_CAST(receiverp, ArraySel)) {
-                receiverp = arrayp->fromp();
-            } else {
-                break;
-            }
-        }
+        AstNodeExpr* const presentp = stateReadValidp(nodep);
         AstVar* const textVarp = newTextVarp(nodep);
         VNRelinker relinker;
         nodep->unlinkFrBack(&relinker);
         const int fieldWidth = nodep->width();
-        const std::string zero = "(_ bv0 " + cvtToStr(fieldWidth + 1) + ")";
+        const std::string zero = missingStateValue(fieldWidth);
         AstNodeExpr* const termp
             = new AstSFormatF{fl, "(ite (= __Vindex %s) (concat #b1 %s) " + zero + ")", false,
                               AstNode::addNext(keyp, getConstFormat(nodep))};
@@ -2109,14 +2191,7 @@ class ConstraintExprVisitor final : public VNVisitor {
             AstNode::addNext(indexp, new AstVarRef{fl, textVarp, VAccess::READ})};
         AstNodeExpr* const tablep
             = newTextBuildp(fl, textVarp, "", VN_AS(bodyp, Foreach), resultp);
-        const std::string name = "|" + m_uniqueNames.get("state lookup") + "|";
-        const std::string top = cvtToStr(fieldWidth);
-        m_stateLookups.push_back(
-            {name, tablep,
-             new AstSFormatF{fl, "((_ extract " + top + " " + top + ") " + name + ")", false,
-                             nullptr}});
-        relinker.relink(new AstSFormatF{
-            fl, "((_ extract " + cvtToStr(fieldWidth - 1) + " 0) " + name + ")", false, nullptr});
+        relinker.relink(bindStateValuep(fl, fieldWidth, tablep));
     }
     void visit(AstMemberRef* nodep) override {
         const std::vector<AstArraySel*> selectors = V3Randomize::stateMemberArraySels(nodep);
@@ -2124,6 +2199,7 @@ class ConstraintExprVisitor final : public VNVisitor {
             editStateMemberSel(nodep, selectors);
             return;
         }
+        if (m_inLookupIndex && editFormat(nodep)) return;
         // Check if rootVar is globalConstrained
         if (nodep->varp()->rand().isRandomizable() && nodep->fromp()) {
             FileLine* const fl = nodep->fileline();

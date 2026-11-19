@@ -18,4 +18,17 @@ module t (  /*AUTOARG*/
   assign outwires[11] = inwires[12];
   assign outwires[12] = inwires[13];  // must be an error here
 
+  class Entry;
+    bit mark;
+  endclass
+
+  class Picker;
+    rand bit mark;
+    Entry entries[-6:3];
+    constraint match_mark {
+      entries[7].mark == mark;
+      entries[32'hffff_fffa].mark == mark;
+    }
+  endclass
+
 endmodule
