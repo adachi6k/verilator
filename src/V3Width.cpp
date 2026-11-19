@@ -1511,7 +1511,10 @@ class WidthVisitor final : public VNVisitor {
 
     // A field of a rand object is state as soon as a non-rand handle or array is traversed.
     static bool isStateHandleArray(AstArraySel* selp) {
-        if (!VN_IS(selp->dtypep()->skipRefp(), ClassRefDType)) return false;
+        const AstNodeDType* dtypep = selp->dtypep()->skipRefp();
+        while (const AstUnpackArrayDType* const arrayp = VN_CAST(dtypep, UnpackArrayDType))
+            dtypep = arrayp->subDTypep()->skipRefp();
+        if (!VN_IS(dtypep, ClassRefDType)) return false;
         AstNode* ownerp = selp->fromp()->baseFromp(false);
         while (const AstMemberRef* const memberp = VN_CAST(ownerp, MemberRef)) {
             if (!memberp->varp()->rand().isRandomizable()) return true;

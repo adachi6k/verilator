@@ -232,6 +232,9 @@ class WidthSelVisitor final : public VNVisitor {
             // SELBIT(array, index) -> ARRAYSEL(array, index)
             AstNodeExpr* subp = rhsp;
             if (fromRange.lo() != 0 || fromRange.hi() < 0) {
+                // Preserve a signed index before the 32-bit lower-bound adjustment.
+                if (subp->isSigned() && subp->width() < 32)
+                    subp = new AstExtendS{nodep->fileline(), subp, 32};
                 subp = newSubNeg(subp, fromRange.lo());
             }
             AstArraySel* const newp = new AstArraySel{nodep->fileline(), fromp, subp};

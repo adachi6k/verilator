@@ -759,7 +759,8 @@ class RandomizeMarkVisitor final : public VNVisitor {
         const bool randObject = nodep->fromp()->user1() || VN_IS(nodep->fromp(), LambdaArgRef);
         const bool randMember = nodep->varp()->rand().isRandomizable();
         const bool inStdWith = m_inStdWith && m_stdRandCallp;
-        if ((randObject && randMember && !inStdWith) || V3Randomize::stateMemberArraySelp(nodep)) {
+        if ((randObject && randMember && !inStdWith)
+            || !V3Randomize::stateMemberArraySels(nodep).empty()) {
             nodep->user1(true);
         } else if (inStdWith && isVarInStdRandomizeArgs(nodep->varp())) {
             nodep->user1(true);
@@ -2795,16 +2796,30 @@ public:
 //######################################################################
 // Randomize method class functions
 
-// A field read from a state handle array still depends on the index being solved.
-AstArraySel* V3Randomize::stateMemberArraySelp(AstMemberRef* memberp) {
+// Return symbolic selectors in declaration order when the field is reached through state.
+std::vector<AstArraySel*> V3Randomize::stateMemberArraySels(AstMemberRef* memberp) {
     if (!memberp->dtypep()->skipRefp()->isIntegralOrPacked()
         || memberp->varp()->lifetime().isStatic())
-        return nullptr;
+        return {};
+    std::vector<AstArraySel*> selectors;
+    bool state = false;
     AstNodeExpr* receiverp = memberp->fromp();
-    while (const AstMemberRef* const innerp = VN_CAST(receiverp, MemberRef))
-        receiverp = innerp->fromp();
-    AstArraySel* const selp = VN_CAST(receiverp, ArraySel);
-    return selp && selp->bitp()->user1() && !selp->fromp()->user1() ? selp : nullptr;
+    while (true) {
+        if (const AstMemberRef* const innerp = VN_CAST(receiverp, MemberRef)) {
+            receiverp = innerp->fromp();
+        } else if (AstArraySel* const selp = VN_CAST(receiverp, ArraySel)) {
+            if (selp->bitp()->user1()) {
+                selectors.push_back(selp);
+                if (!selp->fromp()->user1()) state = true;
+            }
+            receiverp = selp->fromp();
+        } else {
+            break;
+        }
+    }
+    if (!state) return {};
+    std::reverse(selectors.begin(), selectors.end());
+    return selectors;
 }
 
 void V3Randomize::randomizeNetlist(AstNetlist* nodep) {

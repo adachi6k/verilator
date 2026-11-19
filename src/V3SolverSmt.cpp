@@ -2037,26 +2037,43 @@ class ConstraintExprVisitor final : public VNVisitor {
         VL_DO_DANGLING(pushDeletep(newp), newp);
         return true;
     }
-    void editStateMemberSel(AstMemberRef* nodep, AstArraySel* selp) {
+    void editStateMemberSel(AstMemberRef* nodep, const std::vector<AstArraySel*>& selectors) {
         FileLine* const fl = nodep->fileline();
-        const AstUnpackArrayDType* const arrayDtp
-            = VN_AS(selp->fromp()->dtypep()->skipRefp(), UnpackArrayDType);
-        const int width = selp->bitp()->width();
-        AstNodeExpr* const indexp
-            = VN_AS(iterateSubtreeReturnEdits(selp->bitp()->unlinkFrBack()), NodeExpr);
+        // A tuple of all symbolic indices identifies one field, even across nested objects.
+        const auto append = [fl](AstNodeExpr* tuplep, AstNodeExpr* partp) -> AstNodeExpr* {
+            if (!tuplep) return partp;
+            return new AstSFormatF{fl, "(concat %s %s)", false, AstNode::addNext(tuplep, partp)};
+        };
+        AstNodeExpr* indexp = nullptr;
+        AstNodeExpr* keyp = nullptr;
+        std::vector<AstForeachHeader*> headers;
+        for (AstArraySel* const selp : selectors) {
+            const AstUnpackArrayDType* const arrayDtp
+                = VN_AS(selp->fromp()->dtypep()->skipRefp(), UnpackArrayDType);
+            AstNodeExpr* const sourcep = selp->bitp()->unlinkFrBack();
+            const int width = sourcep->width();
+            const int keyWidth = sourcep->isSigned() ? std::max(32, width) : width;
+            AstNodeExpr* partp = VN_AS(iterateSubtreeReturnEdits(sourcep), NodeExpr);
+            // Keys are nonnegative offsets. Preserve the sign of a narrow negative index.
+            if (width < keyWidth) {
+                partp = new AstSFormatF{
+                    fl, "((_ sign_extend " + cvtToStr(keyWidth - width) + ") %s)", false, partp};
+            }
+            indexp = append(indexp, partp);
 
-        // Foreach uses declared indices; ArraySel uses offsets from the low bound.
-        AstVar* const iterp
-            = new AstVar{fl, VVarType::BLOCKTEMP, "__Vindex", nodep->findIntDType()};
-        AstForeachHeader* const headerp
-            = new AstForeachHeader{fl, selp->fromp()->cloneTreePure(false), iterp};
-        AstNodeExpr* offsetp = new AstVarRef{fl, iterp, VAccess::READ};
-        if (const int lo = arrayDtp->declRange().lo()) {
-            offsetp = new AstSub{fl, offsetp, new AstConst{fl, static_cast<uint32_t>(lo)}};
+            // Foreach uses declared indices; ArraySel uses offsets from the low bound.
+            AstVar* const iterp = new AstVar{fl, VVarType::BLOCKTEMP,
+                                             m_uniqueNames.get("__Vindex"), nodep->findIntDType()};
+            headers.push_back(
+                new AstForeachHeader{fl, selp->fromp()->cloneTreePure(false), iterp});
+            AstNodeExpr* offsetp = new AstVarRef{fl, iterp, VAccess::READ};
+            if (const int lo = arrayDtp->declRange().lo()) {
+                offsetp = new AstSub{fl, offsetp, new AstConst{fl, static_cast<uint32_t>(lo)}};
+            }
+            selp->bitp(offsetp->cloneTree(false));
+            keyp = append(keyp,
+                          getConstFormat(adjustWidth(fl, offsetp, keyWidth, VSigning::UNSIGNED)));
         }
-        selp->bitp(offsetp->cloneTree(false));
-        AstNodeExpr* const keyp
-            = getConstFormat(adjustWidth(fl, offsetp, width, VSigning::UNSIGNED));
         AstNodeExpr* presentp = nullptr;
         AstNodeExpr* receiverp = nodep->fromp();
         while (true) {
@@ -2081,15 +2098,17 @@ class ConstraintExprVisitor final : public VNVisitor {
         AstNodeExpr* const termp
             = new AstSFormatF{fl, "(ite (= __Vindex %s) (concat #b1 %s) " + zero + ")", false,
                               AstNode::addNext(keyp, getConstFormat(nodep))};
-        AstNodeStmt* const appendp = newTermAppendp(
+        AstNodeStmt* bodyp = newTermAppendp(
             fl, textVarp,
             new AstCond{fl, presentp, termp, new AstConst{fl, AstConst::String{}, zero}});
+        for (auto it = headers.rbegin(); it != headers.rend(); ++it)
+            bodyp = new AstForeach{fl, *it, bodyp};
         // Bind the symbolic index once, even when it is a compound expression.
         AstNodeExpr* const resultp = new AstSFormatF{
             fl, "(let ((__Vindex %s)) (bvor " + zero + "%s))", false,
             AstNode::addNext(indexp, new AstVarRef{fl, textVarp, VAccess::READ})};
         AstNodeExpr* const tablep
-            = newTextBuildp(fl, textVarp, "", new AstForeach{fl, headerp, appendp}, resultp);
+            = newTextBuildp(fl, textVarp, "", VN_AS(bodyp, Foreach), resultp);
         const std::string name = "|" + m_uniqueNames.get("state lookup") + "|";
         const std::string top = cvtToStr(fieldWidth);
         m_stateLookups.push_back(
@@ -2100,8 +2119,9 @@ class ConstraintExprVisitor final : public VNVisitor {
             fl, "((_ extract " + cvtToStr(fieldWidth - 1) + " 0) " + name + ")", false, nullptr});
     }
     void visit(AstMemberRef* nodep) override {
-        if (AstArraySel* const selp = V3Randomize::stateMemberArraySelp(nodep)) {
-            editStateMemberSel(nodep, selp);
+        const std::vector<AstArraySel*> selectors = V3Randomize::stateMemberArraySels(nodep);
+        if (!selectors.empty()) {
+            editStateMemberSel(nodep, selectors);
             return;
         }
         // Check if rootVar is globalConstrained

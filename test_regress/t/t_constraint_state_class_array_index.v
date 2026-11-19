@@ -59,11 +59,40 @@ class SparseIndex;
   constraint check_field { if (!bypass) entries[idx].payload.flag == 0; }
 endclass
 
+class Group;
+  Entry entries[2];
+  function new();
+    foreach (entries[j]) entries[j] = new;
+  endfunction
+endclass
+
+class GroupIndex;
+  Group groups[2];
+  rand bit i, j;
+  constraint marked { groups[i].entries[j].mark; }
+  function new();
+    foreach (groups[k]) begin
+      groups[k] = new;
+      groups[k].entries[k].mark = 1;
+    end
+  endfunction
+endclass
+
+class SignedIndex;
+  rand bit signed [3:0] idx;
+  Entry entries[16];
+  Entry shifted[-6:3];
+  constraint marked { entries[idx].mark; }
+  constraint negative { shifted[idx].mark; }
+endclass
+
 module t;
   initial begin
     static NestedIndex nested = new;
     static DirectIndex direct = new;
     static SparseIndex sparse = new;
+    static GroupIndex grouped = new;
+    static SignedIndex signed_idx = new;
     int ok;
     foreach (nested.entries[i]) begin
       nested.subobj.idx = 0;
@@ -137,6 +166,41 @@ module t;
     };
     `checkd(ok, 1)
     `checkd(sparse.idx, 1)
+
+    grouped.i = 0;
+    ok = grouped.randomize() with { i == 1; };
+    `checkd(ok, 1)
+    `checkd(grouped.i, 1)
+    `checkd(grouped.j, 1)
+    ok = grouped.randomize() with { i == 0; };
+    `checkd(ok, 1)
+    `checkd(grouped.i, 0)
+    `checkd(grouped.j, 0)
+    ok = grouped.randomize() with { groups[i].entries[1].mark; };
+    `checkd(ok, 1)
+    `checkd(grouped.i, 1)
+    `checkd(grouped.j, 1)
+    grouped.groups[0] = null;
+    ok = grouped.randomize() with { i == 0; };
+    `checkd(ok, 0)
+
+    signed_idx.negative.constraint_mode(0);
+    signed_idx.entries[15] = new;
+    signed_idx.entries[15].mark = 1;
+    ok = signed_idx.randomize() with { idx == -1; };
+    `checkd(ok, 0)
+    signed_idx.entries[7] = new;
+    signed_idx.entries[7].mark = 1;
+    ok = signed_idx.randomize();
+    `checkd(ok, 1)
+    `checkd(int'(signed_idx.idx), 7)
+    signed_idx.marked.constraint_mode(0);
+    signed_idx.negative.constraint_mode(1);
+    signed_idx.shifted[-6] = new;
+    signed_idx.shifted[-6].mark = 1;
+    ok = signed_idx.randomize();
+    `checkd(ok, 1)
+    `checkd(int'(signed_idx.idx), -6)
 
     $write("*-* All Finished *-*\n");
     $finish;
