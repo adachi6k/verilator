@@ -121,6 +121,9 @@ public:
                                        AstCMethodHard* nodep)
         = 0;
 
+    // Finish copy rebinding after all class and inline registrations.
+    virtual void finish() {}
+
     // Per site
     // Class randomize(): add the solver setup to randomizep, and return the
     // solver result (also when the class has no constraints)

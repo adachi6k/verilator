@@ -909,7 +909,9 @@ size_t VlRandomizer::hashConstraints(const std::vector<std::string>& extras) con
 // IEEE 1800 18.4.2: a permutation belongs to one randc variable. A change
 // in an independent array's shape changes the sampling cache but not that cycle.
 void VlRandomizer::updateRandcHistory(const std::vector<uint32_t>& groupIds,
-                                      const std::vector<std::string>& uniqueExprs) {
+                                      const std::vector<std::string>& uniqueExprs,
+                                      RandcHistory& changed,
+                                      std::map<std::string, size_t>& newHashes) {
     std::vector<std::vector<std::string>> varsByTerm;
     size_t begin = 0;
     for (const size_t end : m_constraintVarEnds) {
@@ -920,6 +922,13 @@ void VlRandomizer::updateRandcHistory(const std::vector<uint32_t>& groupIds,
     for (const uint32_t id : groupIds) {
         const auto& names = m_uniqueArrays.at(id);
         varsByTerm.emplace_back(names.begin(), names.end());
+    }
+    std::vector<const std::string*> exprs;
+    for (const auto& hard : m_constraints) exprs.push_back(&hard);
+    for (const auto& unique : uniqueExprs) exprs.push_back(&unique);
+    for (const auto& soft : m_softConstraints) {
+        varsByTerm.emplace_back(soft.vars.begin(), soft.vars.end());
+        exprs.push_back(&soft.expr);
     }
     const size_t exprCount = varsByTerm.size();
     // A nested randc can be registered under several formatted access paths.
@@ -953,16 +962,17 @@ void VlRandomizer::updateRandcHistory(const std::vector<uint32_t>& groupIds,
         std::sort(terms.begin(), terms.end());
         size_t hash = 0;
         for (const size_t term : terms) {
-            const std::string& expr = term < m_constraints.size()
-                                          ? m_constraints[term]
-                                          : uniqueExprs[term - m_constraints.size()];
+            const std::string& expr = *exprs[term];
             hash ^= std::hash<std::string>{}(expr) + 0x9e3779b9 + (hash << 6) + (hash >> 2);
         }
         for (const auto& name : randcNames) {
-            size_t& previous = m_randcConstraintHashes[name];
-            if (hash != previous) {
-                m_randcUsedValues.erase(name);
-                previous = hash;
+            const auto previous = m_randcConstraintHashes.find(name);
+            if (previous != m_randcConstraintHashes.end() && previous->second == hash) continue;
+            newHashes.emplace(name, hash);
+            const auto used = m_randcUsedValues.find(name);
+            if (used != m_randcUsedValues.end()) {
+                changed[name].swap(used->second);
+                m_randcUsedValues.erase(used);
             }
         }
     }
@@ -970,11 +980,18 @@ void VlRandomizer::updateRandcHistory(const std::vector<uint32_t>& groupIds,
 
 void VlRandomizer::emitRandcExclusions(std::ostream& os) const {
     for (const auto& name : m_randcVarNames) {
-        const auto usedIt = m_randcUsedValues.find(name);
-        if (usedIt != m_randcUsedValues.end()) {
-            const int w = m_vars.at(name)->width();
-            for (const uint64_t val : usedIt->second) {
-                os << "(assert (not (= " << name << " (_ bv" << val << " " << w << "))))\n";
+        const auto history = m_randcUsedValues.find(name);
+        if (history == m_randcUsedValues.end()) continue;
+        const VlRandomVar& var = *m_vars.at(name);
+        const int count = var.dimension() ? var.countMatchingElements(m_arr_vars, name) : 1;
+        for (int i = 0; i < count; ++i) {
+            const std::string key = var.dimension() ? m_arr_vars.at({name, i})->m_name : "";
+            const auto used = history->second.find(key);
+            if (used == history->second.end()) continue;
+            for (const uint64_t val : used->second) {
+                os << "(assert (not (=";
+                var.emitElement(os, i);
+                os << " (_ bv" << val << " " << var.width() << "))))\n";
             }
         }
     }
@@ -993,7 +1010,11 @@ void VlRandomizer::recordRandcValues() {
         const auto varIt = m_vars.find(name);
         if (varIt == m_vars.end()) continue;
         const VlRandomVar& var = *varIt->second;
-        m_randcUsedValues[name].insert(readVarValueU64(var.datap(0), var.width()));
+        const int count = var.dimension() ? var.countMatchingElements(m_arr_vars, name) : 1;
+        for (int i = 0; i < count; ++i) {
+            const std::string key = var.dimension() ? m_arr_vars.at({name, i})->m_name : "";
+            m_randcUsedValues[name][key].insert(readVarValueU64(var.datap(i), var.width()));
+        }
     }
 }
 
@@ -1044,7 +1065,10 @@ bool VlRandomizer::nextRandomize(VlRNGReseeds& rngr, bool checkOnly) {
     m_checkOnly = checkOnly;
     std::vector<uint32_t> groupIds;
     const std::vector<std::string> uniqueExprs = buildUniqueExprs(groupIds);
-    if (!checkOnly && !m_randcVarNames.empty()) updateRandcHistory(groupIds, uniqueExprs);
+    const bool advanceCycle = !checkOnly && m_sizeArrays.empty() && !m_randcVarNames.empty();
+    RandcHistory changed, exhausted;
+    std::map<std::string, size_t> newHashes;
+    if (advanceCycle) updateRandcHistory(groupIds, uniqueExprs, changed, newHashes);
 
     // Reseeded from outside, so everything cached came from the old seed.
     if (m_ug2.rngReseeds != rngr.reseeds()) m_ug2 = Unigen2State{};
@@ -1052,9 +1076,17 @@ bool VlRandomizer::nextRandomize(VlRNGReseeds& rngr, bool checkOnly) {
     // Pinned vars make phase ordering moot; skip phased path in check-only.
     bool result;
     if (!m_checkOnly && !m_solveBefore.empty()) {
-        result = nextPhased(rngr, sess, uniqueExprs);
+        result = nextPhased(rngr, sess, uniqueExprs, exhausted);
     } else {
-        result = nextFlat(rngr, sess, uniqueExprs);
+        result = nextFlat(rngr, sess, uniqueExprs, exhausted);
+    }
+    if (advanceCycle && result) {
+        for (const auto& hash : newHashes) m_randcConstraintHashes[hash.first] = hash.second;
+        recordRandcValues();
+    } else if (!result) {
+        // Restore only histories removed for a changed domain or an exhaustion retry.
+        if (!exhausted.empty()) m_randcUsedValues.swap(exhausted);
+        for (auto& entry : changed) m_randcUsedValues[entry.first].swap(entry.second);
     }
     m_ug2.rngReseeds = rngr.reseeds();
     m_checkOnly = false;
@@ -1092,7 +1124,14 @@ std::vector<std::string> VlRandomizer::buildUniqueExprs(std::vector<uint32_t>& g
         if (matchingElementsCount < 2) continue;
         std::ostringstream os;
         os << "(__Vbv (distinct " << varsString.str() << "))";
-        exprs.push_back(os.str());
+        std::string term = os.str();
+        const auto bounds = m_uniqueBounds.find(keyArrNames.first);
+        if (bounds != m_uniqueBounds.end()) {
+            // Whole-array uniqueness is the same at every iteration of this foreach.
+            for (const auto& bound : bounds->second)
+                term = guardSize(bound.first, bound.second, 0, std::move(term));
+        }
+        exprs.push_back(std::move(term));
         if (!m_randcVarNames.empty()) groupIds.push_back(keyArrNames.first);
     }
     return exprs;
@@ -1150,7 +1189,7 @@ void VlRandomizer::emitAsserts(std::ostream& os, const std::vector<std::string>&
 }
 
 bool VlRandomizer::nextFlat(VlRNG& rngr, VlSolverSession& sess,
-                            const std::vector<std::string>& uniqueExprs)
+                            const std::vector<std::string>& uniqueExprs, RandcHistory& exhausted)
     VL_REQUIRES(sess.m_mutex) {
     if (!solverSamples() && m_randcVarNames.empty() && !m_checkOnly && !hasFrozenVar()
         && unigen2(rngr, sess, uniqueExprs)) {
@@ -1160,7 +1199,7 @@ bool VlRandomizer::nextFlat(VlRNG& rngr, VlSolverSession& sess,
     if (!txn.ok()) return false;
     std::iostream& os = sess.os();
     // Randc retry: if unsat due to randc exhaustion, clear history and retry once
-    const bool hasRandc = !m_randcVarNames.empty();
+    const bool hasRandc = !m_checkOnly && m_sizeArrays.empty() && !m_randcVarNames.empty();
     for (int attempt = 0; attempt < (hasRandc ? 2 : 1); ++attempt) {
         os << "(set-option :produce-models true)\n";
         if (!solverSamples()) {
@@ -1177,7 +1216,7 @@ bool VlRandomizer::nextFlat(VlRNG& rngr, VlSolverSession& sess,
 
         // randc exclusions vs. a pinned current value would make every check
         // trivially UNSAT after the first cycle.
-        if (!m_checkOnly) emitRandcExclusions(os);
+        if (hasRandc) emitRandcExclusions(os);
 
         relaxSoftConstraints(sess);
         os << "(check-sat)\n";
@@ -1188,7 +1227,7 @@ bool VlRandomizer::nextFlat(VlRNG& rngr, VlSolverSession& sess,
             os << "(reset)\n";
             // If randc vars have used values, this may be cycle exhaustion - retry
             if (hasRandc && !m_randcUsedValues.empty() && attempt == 0) {
-                m_randcUsedValues.clear();
+                m_randcUsedValues.swap(exhausted);
                 continue;  // Retry without exclusions
             }
             // Skip the unsat-core path in check-only: it re-declares vars
@@ -1201,11 +1240,7 @@ bool VlRandomizer::nextFlat(VlRNG& rngr, VlSolverSession& sess,
         }
         if (!applyModel(sess)) return false;
 
-        if (!m_checkOnly) {
-            if (!solverSamples()) solveDiversity(rngr, sess);
-            // Check-only must not advance randc cycle state.
-            recordRandcValues();
-        }
+        if (!m_checkOnly && !solverSamples()) solveDiversity(rngr, sess);
         return true;
     }
     return false;  // Should not reach here
@@ -1583,14 +1618,14 @@ void VlRandomizer::relaxSoftConstraints(VlSolverSession& sess) VL_REQUIRES(sess.
     if (m_softConstraints.empty()) return;
     std::iostream& os = sess.os();
     os << "(push 1)\n";
-    for (const auto& s : m_softConstraints) os << "(assert (= #b1 " << s << "))\n";
+    for (const auto& s : m_softConstraints) os << "(assert (= #b1 " << s.expr << "))\n";
     os << "(check-sat)\n";
     const VlSolverStatus status = sess.readStatus();
     if (status == VlSolverStatus::SAT || status == VlSolverStatus::FAIL) return;
     os << "(pop 1)\n";
     for (auto it = m_softConstraints.rbegin(); it != m_softConstraints.rend(); ++it) {
         os << "(push 1)\n";
-        os << "(assert (= #b1 " << *it << "))\n";
+        os << "(assert (= #b1 " << it->expr << "))\n";
         os << "(check-sat)\n";
         const VlSolverStatus probe = sess.readStatus();
         if (probe == VlSolverStatus::FAIL) return;
@@ -1842,20 +1877,22 @@ void VlRandomizer::hard(std::string constraint, std::initializer_list<const char
 }
 
 void VlRandomizer::soft(std::string constraint, const char* /*filename*/, uint32_t /*linenum*/,
-                        const char* /*source*/) {
-    m_softConstraints.emplace_back(std::move(constraint));
+                        const char* /*source*/, std::initializer_list<const char*> varNames) {
+    m_softConstraints.push_back({std::move(constraint), varNames});
 }
 
 void VlRandomizer::disable_soft(const std::string& varName) {
     // IEEE 1800-2023 18.5.13: Remove all soft constraints referencing the variable
-    m_softConstraints.erase(
-        std::remove_if(m_softConstraints.begin(), m_softConstraints.end(),
-                       [&](const std::string& c) { return c.find(varName) != std::string::npos; }),
-        m_softConstraints.end());
+    m_softConstraints.erase(std::remove_if(m_softConstraints.begin(), m_softConstraints.end(),
+                                           [&](const SoftConstraint& c) {
+                                               return c.expr.find(varName) != std::string::npos;
+                                           }),
+                            m_softConstraints.end());
 }
 
 void VlRandomizer::clearConstraints() {
     m_sizeArrays.clear();
+    m_uniqueBounds.clear();
     m_constraints.clear();
     m_constraintVarNames.clear();
     m_constraintVarEnds.clear();
@@ -1868,6 +1905,7 @@ void VlRandomizer::clearConstraints() {
 
 void VlRandomizer::clearAll() {
     m_sizeArrays.clear();
+    m_uniqueBounds.clear();
     m_constraints.clear();
     m_constraintVarNames.clear();
     m_constraintVarEnds.clear();
@@ -1941,14 +1979,14 @@ const char* VlRandomizer::phasedLogic() const {
 }
 
 bool VlRandomizer::nextPhased(VlRNG& rngr, VlSolverSession& sess,
-                              const std::vector<std::string>& uniqueExprs)
+                              const std::vector<std::string>& uniqueExprs, RandcHistory& prior)
     VL_REQUIRES(sess.m_mutex) {
     // Solve layer by layer with ALL constraints, pinning earlier layers
     std::vector<std::vector<std::string>> layers;
     if (!buildSolveLayers(layers)) return false;
 
     // No layers means no solve_before pair survived
-    if (layers.empty()) return nextFlat(rngr, sess, uniqueExprs);
+    if (layers.empty()) return nextFlat(rngr, sess, uniqueExprs, prior);
 
     VlSolverTxn txn{sess};
     if (!txn.ok()) return false;
@@ -1956,7 +1994,7 @@ bool VlRandomizer::nextPhased(VlRNG& rngr, VlSolverSession& sess,
     bool exhausted = false;
     if (solvePhases(rngr, sess, layers, uniqueExprs, exhausted)) return true;
     if (!exhausted) return false;
-    m_randcUsedValues.clear();
+    m_randcUsedValues.swap(prior);
     sess.os() << "(reset)\n";
     return solvePhases(rngr, sess, layers, uniqueExprs, exhausted);
 }
@@ -1983,8 +2021,7 @@ bool VlRandomizer::solvePhases(VlRNG& rngr, VlSolverSession& sess,
         }
         emitAsserts(os, uniqueExprs, false);
 
-        // Randc: exclude previously used values
-        emitRandcExclusions(os);
+        if (m_sizeArrays.empty()) emitRandcExclusions(os);
 
         // Soft constraints participate in every phase, priority-ordered.
         relaxSoftConstraints(sess);
@@ -1994,15 +2031,14 @@ bool VlRandomizer::solvePhases(VlRNG& rngr, VlSolverSession& sess,
         const VlSolverStatus status = sess.readStatus();
         if (status != VlSolverStatus::SAT) {
             // Only exhausted randc values are worth a retry; a lost solver is not
-            if (status == VlSolverStatus::UNSAT) exhaustedr = !m_randcUsedValues.empty();
+            if (status == VlSolverStatus::UNSAT)
+                exhaustedr = m_sizeArrays.empty() && !m_randcUsedValues.empty();
             return false;
         }
 
         if (isFinalPhase) {
             if (!applyModel(sess)) return false;
             if (!solverSamples()) solveDiversityXor(rngr, sess);
-            // Record solved randc values for future exclusion
-            recordRandcValues();
         } else {
             if (!solvePhaseValues(sess, rngr, layers[phase], solvedValues)) return false;
             os << "(reset)\n";

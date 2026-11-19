@@ -2435,6 +2435,15 @@ class ConstraintExprVisitor final : public VNVisitor {
                     fl, genVarRefp(VAccess::READ), VCMethod::RANDOMIZER_UNIQUE, namep};
                 randUniqueCallp->dtypep(nodep->findVoidDType());
                 randUniqueCallp->addPinsp(new AstConst{fl, *m_uniqueConstraintIdp});
+                if (!m_foreachBounds.empty()) {
+                    std::string bounds = "{";
+                    for (const auto& bound : m_foreachBounds) {
+                        if (bounds.size() > 1) bounds += ", ";
+                        bounds += "{\"" + bound.first->name() + "\", \""
+                                  + SmtUtil::sizeVarName(bound.first) + "\"}";
+                    }
+                    randUniqueCallp->addPinsp(new AstCExpr{fl, AstCExpr::Pure{}, bounds + "}"});
+                }
                 setupStmtsp = AstNode::addNext(setupStmtsp, new AstStmtExpr{fl, randUniqueCallp});
             }
         }
@@ -2535,6 +2544,10 @@ class ConstraintExprVisitor final : public VNVisitor {
         }
         callp->addPinsp(
             new AstCExpr{nodep->fileline(), AstCExpr::Pure{}, "\"" + prettyText + "\""});
+        if (method == VCMethod::RANDOMIZER_SOFT) {
+            callp->addPinsp(
+                new AstCExpr{nodep->fileline(), AstCExpr::Pure{}, constraintVarsList(vars)});
+        }
         nodep->replaceWith(callp->makeStmt());
         VL_DO_DANGLING(nodep->deleteTree(), nodep);
     }
@@ -3110,6 +3123,7 @@ class SolverSmtLowering final : public V3SolverLowering {
     std::map<AstClass*, VInsertionSet<AstVar*>> m_elementArrays;  // Per-class element references
     std::map<AstConstraint*, VInsertionSet<AstVar*>> m_constraintUniqueArrays;
     std::map<AstConstraint*, VInsertionSet<AstVar*>> m_constraintSizedArrays;
+    std::vector<std::pair<AstClass*, AstFunc*>> m_copyUpdates;  // Completed after inline lowering
     uint32_t m_uniqueConstraintId = 0;  // current ID of unique call
 
     // METHODS
@@ -3359,11 +3373,7 @@ class SolverSmtLowering final : public V3SolverLowering {
         nodep->hasRandVarsUpdate(true);
         if (genp && randModeVarp) addSetRandMode(updatep, genp, randModeVarp);
 
-        for (AstClass* classp = nodep; classp;
-             classp = classp->extendsp() ? classp->extendsp()->classp() : nullptr) {
-            AstNodeFTask* const newp = VN_AS(m_memberMap.findMember(classp, "new"), NodeFTask);
-            addUpdateRandVarsStmts(updatep, newp->stmtsp());
-        }
+        m_copyUpdates.emplace_back(nodep, updatep);
     }
 
     // Rewrite a LogIf-of-Dist chain into nested AstConstraintIf. The outermost
@@ -4105,6 +4115,16 @@ public:
                       const RandModeVars& modeVars, VNDeleter& deleter)
         : V3SolverLowering{memberMap, uniqueNames, modeVars, deleter} {}
     ~SolverSmtLowering() override = default;
+    void finish() override {
+        // Derived and inline constraints can register inherited size proxies late.
+        for (const auto& update : m_copyUpdates) {
+            for (AstClass* classp = update.first; classp;
+                 classp = classp->extendsp() ? classp->extendsp()->classp() : nullptr) {
+                AstNodeFTask* const newp = VN_AS(m_memberMap.findMember(classp, "new"), NodeFTask);
+                addUpdateRandVarsStmts(update.second, newp->stmtsp());
+            }
+        }
+    }
 
     // V3SolverLowering
     void prepareClass(AstClass* classp) override { createRandomGenerator(classp); }
@@ -4300,11 +4320,12 @@ public:
                                                        nodep->findBasicDType(VBasicDTypeKwd::BIT)};
                 finalOkVarp->funcLocal(true);
                 randomizep->addDeclsp(finalOkVarp);
-                randomizep->addStmtsp(new AstAssign{
-                    fl, new AstVarRef{fl, finalOkVarp, VAccess::WRITE}, newSolverCallp(genp)});
+                randomizep->addStmtsp(
+                    new AstAssign{fl, new AstVarRef{fl, finalOkVarp, VAccess::WRITE},
+                                  new AstLogAnd{fl, new AstVarRef{fl, sizeOkVarp, VAccess::READ},
+                                                newSolverCallp(genp)}});
 
-                beginValp = new AstAnd{fl, new AstVarRef{fl, sizeOkVarp, VAccess::READ},
-                                       new AstVarRef{fl, finalOkVarp, VAccess::READ}};
+                beginValp = new AstVarRef{fl, finalOkVarp, VAccess::READ};
             } else {
                 beginValp = newSolverCallp(genp);
             }
@@ -4575,15 +4596,14 @@ public:
 
             // Final solve: element values with sizes pinned
             AstCExpr* const solverCall2p = newSolverCallp(localGenp);
-            randomizeFuncp->addStmtsp(
-                new AstAssign{fl, new AstVarRef{fl, finalOkVarp, VAccess::WRITE}, solverCall2p});
-
             randomizeFuncp->addStmtsp(new AstAssign{
-                fl, new AstVarRef{fl, retVarp, VAccess::WRITE},
-                new AstAnd{fl,
-                           new AstAnd{fl, new AstVarRef{fl, basicOkVarp, VAccess::READ},
-                                      new AstVarRef{fl, sizeOkVarp, VAccess::READ}},
-                           new AstVarRef{fl, finalOkVarp, VAccess::READ}}});
+                fl, new AstVarRef{fl, finalOkVarp, VAccess::WRITE},
+                new AstLogAnd{fl, new AstVarRef{fl, sizeOkVarp, VAccess::READ}, solverCall2p}});
+
+            randomizeFuncp->addStmtsp(
+                new AstAssign{fl, new AstVarRef{fl, retVarp, VAccess::WRITE},
+                              new AstAnd{fl, new AstVarRef{fl, basicOkVarp, VAccess::READ},
+                                         new AstVarRef{fl, finalOkVarp, VAccess::READ}}});
         } else {
             VL_DO_DANGLING(capturedClonep->deleteTree(), capturedClonep);
 
