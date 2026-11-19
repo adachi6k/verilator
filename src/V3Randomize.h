@@ -20,8 +20,10 @@
 #include "config_build.h"
 #include "verilatedos.h"
 
+class AstArraySel;
 class AstClass;
 class AstFunc;
+class AstMemberRef;
 class AstNetlist;
 class AstNodeModule;
 
@@ -29,6 +31,7 @@ class VMemberMap;
 
 class V3Randomize final {
 public:
+    static AstArraySel* stateMemberArraySelp(AstMemberRef* memberp) VL_MT_DISABLED;
     static void randomizeNetlist(AstNetlist* nodep) VL_MT_DISABLED;
 
     static AstFunc* newRandomizeFunc(VMemberMap& memberMap, AstClass* nodep,

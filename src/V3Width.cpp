@@ -1509,6 +1509,19 @@ class WidthVisitor final : public VNVisitor {
         }
     }
 
+    // A field of a rand object is state as soon as a non-rand handle or array is traversed.
+    static bool isStateHandleArray(AstArraySel* selp) {
+        if (!VN_IS(selp->dtypep()->skipRefp(), ClassRefDType)) return false;
+        AstNode* ownerp = selp->fromp()->baseFromp(false);
+        while (const AstMemberRef* const memberp = VN_CAST(ownerp, MemberRef)) {
+            if (!memberp->varp()->rand().isRandomizable()) return true;
+            ownerp = memberp->fromp()->baseFromp(false);
+        }
+        if (const AstNodeVarRef* const refp = VN_CAST(ownerp, NodeVarRef)) {
+            return !refp->varp()->rand().isRandomizable();
+        }
+        return !VN_IS(ownerp, ThisRef);
+    }
     void visit(AstArraySel* nodep) override {
         // Signed/Real: Output signed iff LHS signed/real; binary operator
         // Note by contrast, bit extract selects are unsigned
@@ -1593,8 +1606,15 @@ class WidthVisitor final : public VNVisitor {
                         }
                     }
                 }
-                widthCheckSized(nodep, "Extract Range", nodep->bitp(), selwidthDTypep, EXTEND_EXP,
-                                false /*NOWARN*/);
+                // A symbolic class-handle index must distinguish an invalid index from its
+                // in-range low bits when the solver selects an object field.
+                const bool constraint
+                    = m_constraintp || (m_withp && VN_IS(m_withp->exprp(), NodeConstraintItem));
+                if (!constraint || nodep->bitp()->width() <= selwidth
+                    || !isStateHandleArray(nodep)) {
+                    widthCheckSized(nodep, "Extract Range", nodep->bitp(), selwidthDTypep,
+                                    EXTEND_EXP, false /*NOWARN*/);
+                }
             }
         }
     }

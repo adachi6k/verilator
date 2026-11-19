@@ -759,7 +759,7 @@ class RandomizeMarkVisitor final : public VNVisitor {
         const bool randObject = nodep->fromp()->user1() || VN_IS(nodep->fromp(), LambdaArgRef);
         const bool randMember = nodep->varp()->rand().isRandomizable();
         const bool inStdWith = m_inStdWith && m_stdRandCallp;
-        if (randObject && randMember && !inStdWith) {
+        if ((randObject && randMember && !inStdWith) || V3Randomize::stateMemberArraySelp(nodep)) {
             nodep->user1(true);
         } else if (inStdWith && isVarInStdRandomizeArgs(nodep->varp())) {
             nodep->user1(true);
@@ -2794,6 +2794,18 @@ public:
 
 //######################################################################
 // Randomize method class functions
+
+// A field read from a state handle array still depends on the index being solved.
+AstArraySel* V3Randomize::stateMemberArraySelp(AstMemberRef* memberp) {
+    if (!memberp->dtypep()->skipRefp()->isIntegralOrPacked()
+        || memberp->varp()->lifetime().isStatic())
+        return nullptr;
+    AstNodeExpr* receiverp = memberp->fromp();
+    while (const AstMemberRef* const innerp = VN_CAST(receiverp, MemberRef))
+        receiverp = innerp->fromp();
+    AstArraySel* const selp = VN_CAST(receiverp, ArraySel);
+    return selp && selp->bitp()->user1() && !selp->fromp()->user1() ? selp : nullptr;
+}
 
 void V3Randomize::randomizeNetlist(AstNetlist* nodep) {
     UINFO(2, __FUNCTION__ << ":");
