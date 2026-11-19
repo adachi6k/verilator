@@ -1830,8 +1830,8 @@ class RandomizeVisitor final : public VNVisitor {
             return VN_IS(dtypep, ClassRefDType);
         });
     }
-    // True if this class owns a global constraint: a member-select chain rooted
-    // at a rand class-typed handle reaching into a sub-object.
+    // A constrained random field reached through random class handles belongs to this solve.
+    // A state-only leaf such as b.cfg.length does not make its owner globally constrained.
     bool classOwnsGlobalConstraint(const AstClass* classp) const {
         return classp->existsMember([](const AstClass*, const AstConstraint* constrp) {
             bool owns = false;
