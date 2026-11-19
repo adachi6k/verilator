@@ -393,7 +393,7 @@ class WidthVisitor final : public VNVisitor {
     const AstConstraint* m_constraintp = nullptr;  // Current constraint
     AstNodeProcedure* m_procedurep = nullptr;  // Current final/always
     const AstNode* m_writerp = nullptr;  // Assign, release or driving pin whose lvalue is iterated
-    const AstWith* m_withp = nullptr;  // Current 'with' statement
+    std::vector<const AstWith*> m_withs;  // Enclosing lambdas, outermost first
     const AstFunc* m_funcp = nullptr;  // Current function
     const AstAttrOf* m_attrp = nullptr;  // Current attribute
     const AstNodeExpr* m_randomizeFromp = nullptr;  // Current randomize method call fromp
@@ -1783,8 +1783,9 @@ class WidthVisitor final : public VNVisitor {
         userIterateAndNext(nodep->thsp(), WidthVP{CONTEXT_DET, PRELIM}.p());  // FINAL in AstSel
         // Error recovery returns this existing receiver rather than a new selection.
         AstNodeExpr* const fromp = nodep->fromp();
+        // A function body or array lambda may later be inlined into a constraint.
         const bool constraint
-            = m_constraintp || (m_withp && VN_IS(m_withp->exprp(), NodeConstraintItem));
+            = v3Global.useRandomizeMethods() && (m_constraintp || m_funcp || !m_withs.empty());
         AstNode* const selp = V3Width::widthSelNoIterEdit(nodep, constraint);
         if (selp != nodep) {
             VL_DANGLING(nodep);
@@ -9319,8 +9320,7 @@ class WidthVisitor final : public VNVisitor {
         m_underCast = false;  // The lambda is checked independently of a cast of the result.
         // Should otherwise be underneath a method call
         AstNodeDType* const vdtypep = m_vup->dtypeNullSkipRefp();
-        VL_RESTORER(m_withp);
-        m_withp = nodep;
+        m_withs.push_back(nodep);
         userIterateChildren(nodep->indexArgRefp(), nullptr);
         userIterateChildren(nodep->valueArgRefp(), nullptr);
         if (!nodep->exprp()) {
@@ -9344,14 +9344,18 @@ class WidthVisitor final : public VNVisitor {
                                    nodep->dtypep());
             }
         }
+        m_withs.pop_back();
     }
     void visit(AstLambdaArgRef* nodep) override {
-        UASSERT_OBJ(m_withp, nodep, "LambdaArgRef not underneath 'with' lambda");
-        if (nodep->index()) {
-            nodep->dtypeFrom(m_withp->indexArgRefp());
-        } else {
-            nodep->dtypeFrom(m_withp->valueArgRefp());
+        for (auto it = m_withs.rbegin(); it != m_withs.rend(); ++it) {
+            const AstLambdaArgRef* const argp
+                = nodep->index() ? (*it)->indexArgRefp() : (*it)->valueArgRefp();
+            if (argp->name() == nodep->name()) {
+                nodep->dtypeFrom(argp);
+                return;
+            }
         }
+        nodep->v3fatalSrc("Lambda argument without an enclosing declaration");
     }
     void visit(AstNetlist* nodep) override {
         // Iterate modules backwards, in bottom-up order.  That's faster

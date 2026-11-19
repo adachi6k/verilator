@@ -34,6 +34,7 @@ class VMemberMap;
 class V3Randomize final {
 public:
     static std::vector<AstArraySel*> stateMemberArraySels(AstMemberRef* memberp) VL_MT_DISABLED;
+    static void narrowConstraintIndex(AstArraySel* selp) VL_MT_DISABLED;
     static void randomizeNetlist(AstNetlist* nodep) VL_MT_DISABLED;
 
     static AstFunc* newRandomizeFunc(VMemberMap& memberMap, AstClass* nodep,

@@ -191,7 +191,7 @@ static void checkRandTypeEligibility(AstNode* contextp, AstNodeDType* dtypep, bo
 
 //######################################################################
 // Restore the usual scalar subscript before naming solver variables or generating native reads.
-static void narrowConstraintIndex(AstArraySel* selp) {
+void V3Randomize::narrowConstraintIndex(AstArraySel* selp) {
     const int width = selp->constraintIndexWidth();
     if (width <= 0) return;
     selp->constraintIndexWidth(0);
@@ -229,7 +229,6 @@ class RandomizeMarkVisitor final : public VNVisitor {
     AstNodeStmt* m_stmtp = nullptr;  // Current statement
     AstNodeFTaskRef* m_stdRandCallp = nullptr;  // Current std::randomize() call
     bool m_inStdWith = false;  // True when inside a 'with {}' clause
-    std::unordered_set<AstArraySel*> m_lookupSelectors;
     std::set<AstNodeVarRef*> m_staticRefs;  // References to static variables under `with` clauses
     AstWith* m_withp = nullptr;  // Current 'with' constraint node
 
@@ -775,7 +774,6 @@ class RandomizeMarkVisitor final : public VNVisitor {
         const bool randMember = nodep->varp()->rand().isRandomizable();
         const bool inStdWith = m_inStdWith && m_stdRandCallp;
         const auto selectors = V3Randomize::stateMemberArraySels(nodep);
-        m_lookupSelectors.insert(selectors.begin(), selectors.end());
         if ((randObject && randMember && !inStdWith) || !selectors.empty()) {
             nodep->user1(true);
         } else if (inStdWith && isVarInStdRandomizeArgs(nodep->varp())) {
@@ -818,9 +816,10 @@ class RandomizeMarkVisitor final : public VNVisitor {
     void visit(AstWith* nodep) override {
         VL_RESTORER(m_withp);
         m_withp = nodep;
+        VL_RESTORER(m_inStdWith);
         if (m_stdRandCallp && nodep == m_stdRandCallp->withp()) m_inStdWith = true;
         iterateChildrenConst(nodep);
-        m_inStdWith = false;
+        if (m_constraintExprGenp && nodep->exprp()) nodep->user1(nodep->exprp()->user1());
     }
 
     void visit(AstNodeExpr* nodep) override {
@@ -850,9 +849,6 @@ public:
         iterateConst(nodep);
         markAllDerived();
         setPackageRefs();
-        nodep->foreach([&](AstArraySel* selp) {
-            if (!m_lookupSelectors.count(selp)) narrowConstraintIndex(selp);
-        });
     }
     ~RandomizeMarkVisitor() override = default;
 };
