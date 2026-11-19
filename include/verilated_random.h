@@ -269,6 +269,8 @@ class VlRandomizer VL_NOT_FINAL {
     std::unordered_set<std::string> m_staticVars;  // Names of static rand vars
     int m_index = 0;  // Internal counter for key generation
     std::set<std::string> m_randcVarNames;  // Names of randc variables for cyclic tracking
+    std::vector<const char*> m_sizeArrays;  // Direct containers resized by this solve
+    std::set<std::pair<std::string, std::string>> m_randcAliases;  // Runtime and source names
     std::map<std::string, std::set<uint64_t>>
         m_randcUsedValues;  // Previously used values per randc var (exclusion-based cycling)
     std::map<std::string, size_t> m_randcConstraintHashes;  // Per-variable cycle domains
@@ -380,6 +382,14 @@ public:
     // METHODS
     // Finds the next solution satisfying the constraints
     bool next(VlRNGReseeds& rngr);
+    void setSizeArrays(std::initializer_list<const char*> names) { m_sizeArrays = names; }
+    std::string guardSize(const char* arrayp, const char* sizep, uint32_t index,
+                          std::string term) const;
+    bool nextSize(VlRNGReseeds& rngr) {
+        // The final solve rebinds these containers after their new sizes are known.
+        for (const char* namep : m_sizeArrays) clear_arr_table(namep);
+        return next(rngr);
+    }
     // Validate the constraints against the current runtime values of every
     // registered rand variable without picking new ones.
     bool next_check_only(VlRNGReseeds& rngr);
@@ -908,7 +918,8 @@ public:
             = std::make_shared<const VlRandomArrayVarTemplate<VlAssocArray<T_Key, T_Value>>>(
                 name, it->second->width(), &var, dimension, it->second->randModeIdx(), keyWidths);
         m_index = 0;
-        update_arr_table(var, name, dimension);
+        clear_arr_table(name);
+        record_arr_table(var, name, dimension, {}, {});
     }
 
     template <typename T_Key, typename T_Value>
@@ -949,7 +960,8 @@ public:
     void disable_soft(const std::string& varName);
     void clearConstraints();
     void clearAll();  // Clear both constraints and variables
-    void markRandc(const std::string& name);  // Mark variable as randc for cyclic tracking
+    void markRandc(const std::string& name,
+                   const char* aliasp = nullptr);  // Mark variable as randc for cyclic tracking
     void solveBefore(const std::string& beforeName,
                      const std::string& afterName);  // Register solve-before ordering
     void set_randmode(const VlQueue<CData>& randmode) { m_randmodep = &randmode; }

@@ -238,12 +238,14 @@ endclass
 class RandcWithArray;
   randc bit [1:0] value;
   rand bit [1:0] bridge;
+  rand bit [1:0] endpoint;
   bit [1:0] limit = 3;
   rand bit [3:0] data[];
   int length;
   constraint legal {
+    endpoint < limit;
+    bridge == endpoint;
     value == bridge;
-    bridge < limit;
     unique {data};
     foreach (data[i]) data[i] != 0;
   }

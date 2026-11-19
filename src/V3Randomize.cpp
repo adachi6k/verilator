@@ -2785,7 +2785,6 @@ public:
         });
 
         iterate(nodep);
-        m_solverp->finish();
         nodep->foreach([&](AstConstraint* constrp) {
             VL_DO_DANGLING(pushDeletep(constrp->unlinkFrBack()), constrp);
         });

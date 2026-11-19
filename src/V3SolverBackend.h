@@ -121,9 +121,6 @@ public:
                                        AstCMethodHard* nodep)
         = 0;
 
-    // Complete registrations whose placement depends on all class and inline constraints.
-    virtual void finish() {}
-
     // Per site
     // Class randomize(): add the solver setup to randomizep, and return the
     // solver result (also when the class has no constraints)

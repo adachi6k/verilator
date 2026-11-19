@@ -86,6 +86,7 @@ endclass
 class SolverShrink;
   rand bit values[];
   constraint size_c {values.size() == 2;}
+  constraint by_index {foreach (values[i]) int'(values[i]) == i;}
   constraint distinct_values {unique {values};}
   function void pre_randomize();
     values = new[3];
@@ -101,6 +102,92 @@ class IndependentSize;
     soft flags[0] == flags[1];
     foreach (data[i]) data[i] == 0;
   }
+endclass
+
+class KeyedValues;
+  rand bit [7:0] entries[int];
+  int key;
+  constraint legal {
+    unique {entries};
+    entries[1] == 0;
+  }
+  function void pre_randomize();
+    entries.delete();
+    entries[key] = '1;
+  endfunction
+endclass
+
+class CallbackQueue;
+  rand bit [4:0] q[$];
+  int count = 4;
+  constraint legal {
+    unique {q};
+    foreach (q[i]) q[i] != 0;
+  }
+  function void pre_randomize();
+    q.delete();
+    repeat (count) q.push_back(0);
+  endfunction
+  function void check_values();
+    `checkd(q.size(), count);
+    foreach (q[i]) begin
+      `checkd(q[i] != 0, 1);
+      foreach (q[j]) if (j < i) `checkd(q[i] != q[j], 1);
+    end
+  endfunction
+endclass
+
+class StateValues;
+  bit [3:0] values[];
+  bit duplicate;
+  constraint legal {unique {values};}
+  function void pre_randomize();
+    values = '{4, duplicate ? 4 : 7};
+  endfunction
+endclass
+
+class ExplicitValues;
+  bit [3:0] values[];
+  constraint legal {unique {values};}
+endclass
+
+class StaticValues;
+  static rand bit [3:0] values[];
+  constraint legal {unique {values};}
+endclass
+
+class FrozenResize;
+  rand bit [3:0] values[];
+  int wanted;
+  int count;
+  constraint legal {
+    values.size() == wanted;
+    unique {values};
+  }
+  function void pre_randomize();
+    values = new[count];
+    foreach (values[i]) values[i] = 4'(i + 1);
+  endfunction
+endclass
+
+class SizedCallbackStream extends CallbackStream;
+  constraint length_c {values.size() == 3;}
+endclass
+
+class PlainCallbackStream extends CallbackStream;
+endclass
+
+class SizeChild;
+  rand int data[];
+endclass
+
+class SizeParent;
+  rand SizeChild first;
+  rand SizeChild second;
+  function new();
+    first = new;
+    second = new;
+  endfunction
 endclass
 
 module t;
@@ -214,6 +301,149 @@ module t;
         `checkd(independent.data.size(), 1);
         `checkd(independent.flags[0] != independent.flags[1], 1);
       end
+    end
+
+    begin
+      automatic KeyedValues original = new;
+      KeyedValues copy;
+      original.key = 2;
+      repeat (4) begin
+        ok = original.randomize();
+        `checkd(ok, 1);
+        `checkd(original.entries.exists(2), 1);
+        `checkd(original.entries.num(), 1);
+      end
+      copy = new original;
+      original.key = 1;
+      repeat (12) begin
+        ok = original.randomize();
+        `checkd(ok, 1);
+        `checkd(original.entries.num(), 1);
+        `checkd(original.entries[1], 0);
+        `checkd(original.entries.exists(2), 0);
+      end
+      `checkd(copy.entries.exists(2), 1);
+      `checkd(copy.entries.exists(1), 0);
+    end
+
+    begin
+      automatic CallbackQueue q = new;
+      CallbackQueue copy;
+      for (int n = 5; n >= 0; --n) begin
+        q.count = n;
+        ok = q.randomize();
+        `checkd(ok, 1);
+        q.check_values();
+      end
+      q.q = '{1, 2, 3};
+      copy = new q;
+      copy.count = 4;
+      ok = copy.randomize();
+      `checkd(ok, 1);
+      copy.check_values();
+      `checkd(q.q.size(), 3);
+      `checkd(q.q[0], 1);
+    end
+
+    begin
+      automatic StateValues state_values = new;
+      automatic ExplicitValues listed = new;
+      state_values.duplicate = 1;
+      ok = state_values.randomize();
+      `checkd(ok, 0);
+      `checkd(state_values.values[0], 4);
+      `checkd(state_values.values[1], 4);
+      state_values.duplicate = 0;
+      ok = state_values.randomize();
+      `checkd(ok, 1);
+      `checkd(state_values.values[0], 4);
+      `checkd(state_values.values[1], 7);
+      listed.values = '{4, 4};
+      ok = listed.randomize(values);
+      `checkd(ok, 1);
+      `checkd(listed.values[0] != listed.values[1], 1);
+      listed.values = '{4, 4};
+      ok = listed.randomize();
+      `checkd(ok, 0);
+      `checkd(listed.values[1], 4);
+    end
+
+    begin
+      automatic StaticValues first = new;
+      automatic StaticValues second = new;
+      first.values = '{4, 4};
+      second.values.rand_mode(0);
+      ok = first.randomize();
+      `checkd(ok, 0);
+      `checkd(first.values[0], 4);
+      `checkd(first.values[1], 4);
+      first.values[1] = 7;
+      ok = second.randomize();
+      `checkd(ok, 1);
+      `checkd(second.values[0], 4);
+      `checkd(second.values[1], 7);
+      first.values.rand_mode(1);
+      second.values = '{0, 0};
+      ok = second.randomize();
+      `checkd(ok, 1);
+      `checkd(first.values[0] != first.values[1], 1);
+    end
+
+    begin
+      automatic FrozenResize d = new;
+      d.count = 4;
+      d.wanted = 4;
+      ok = d.randomize();
+      `checkd(ok, 1);
+      d.values.rand_mode(0);
+      d.count = 0;
+      ok = d.randomize();
+      `checkd(ok, 0);
+      `checkd(d.values.size(), 0);
+      d.count = 2;
+      d.wanted = 2;
+      ok = d.randomize();
+      `checkd(ok, 1);
+      `checkd(d.values[0], 1);
+      `checkd(d.values[1], 2);
+    end
+
+    begin
+      automatic CallbackStream base = new;
+      automatic SizedCallbackStream sized_stream = new;
+      automatic PlainCallbackStream plain = new;
+      sized_stream.count = 3;
+      ok = sized_stream.randomize();
+      `checkd(ok, 1);
+      sized_stream.check_values();
+      base.count = 2;
+      ok = base.randomize() with {values.size() == 2;};
+      `checkd(ok, 1);
+      base.check_values();
+      plain.count = 5;
+      ok = plain.randomize();
+      `checkd(ok, 1);
+      plain.check_values();
+      base.count = 6;
+      ok = base.randomize();
+      `checkd(ok, 1);
+      base.check_values();
+      base.count = 6;
+      ok = base.randomize() with {values.size() == 3;};
+      `checkd(ok, 1);
+      base.count = 3;
+      base.check_values();
+    end
+
+    begin
+      automatic SizeParent parent = new;
+      ok = parent.randomize() with {
+        first.data.size() == 2;
+        second.data.size() == 4;
+      };
+      `checkd(ok, 1);
+      `checkd(parent.first.data.size(), 2);
+      `checkd(parent.second.data.size(), 4);
     end
 
     $write("*-* All Finished *-*\n");

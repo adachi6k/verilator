@@ -897,10 +897,10 @@ size_t VlRandomizer::hashConstraints(const std::vector<std::string>& extras) con
         h ^= std::hash<int>{}(var.second->width()) + 0x9e3779b9 + (h << 6) + (h >> 2);
         h ^= std::hash<int>{}(var.second->dimension()) + 0x9e3779b9 + (h << 6) + (h >> 2);
     }
-    // Keys are one per array element, so a resized queue gets a different hash.
+    // Include the actual subscripts: associative keys can change at a fixed size.
     for (const auto& elem : m_arr_vars) {
         h ^= std::hash<std::string>{}(elem.first.first) + 0x9e3779b9 + (h << 6) + (h >> 2);
-        h ^= std::hash<int>{}(elem.first.second) + 0x9e3779b9 + (h << 6) + (h >> 2);
+        h ^= std::hash<std::string>{}(elem.second->m_name) + 0x9e3779b9 + (h << 6) + (h >> 2);
     }
     return h;
 }
@@ -909,43 +909,60 @@ size_t VlRandomizer::hashConstraints(const std::vector<std::string>& extras) con
 // in an independent array's shape changes the sampling cache but not that cycle.
 void VlRandomizer::updateRandcHistory(const std::vector<uint32_t>& groupIds,
                                       const std::vector<std::string>& uniqueExprs) {
-    for (const std::string& name : m_randcVarNames) {
-        std::set<std::string> related{name};
-        std::set<size_t> terms;
-        const auto connect = [&](size_t term, const auto first, const auto last) {
-            if (terms.count(term)) return;
-            if (std::any_of(first, last, [&](const auto& var) { return related.count(var); })) {
-                related.insert(first, last);
-                terms.insert(term);
+    std::vector<std::vector<std::string>> varsByTerm;
+    size_t begin = 0;
+    for (const size_t end : m_constraintVarEnds) {
+        varsByTerm.emplace_back(m_constraintVarNames.begin() + begin,
+                                m_constraintVarNames.begin() + end);
+        begin = end;
+    }
+    for (const uint32_t id : groupIds) {
+        const auto& names = m_uniqueArrays.at(id);
+        varsByTerm.emplace_back(names.begin(), names.end());
+    }
+    const size_t exprCount = varsByTerm.size();
+    // A nested randc can be registered under several formatted access paths.
+    for (const auto& alias : m_randcAliases) varsByTerm.push_back({alias.first, alias.second});
+
+    std::unordered_map<std::string, std::vector<size_t>> termsByVar;
+    for (size_t i = 0; i < varsByTerm.size(); ++i) {
+        for (const auto& name : varsByTerm[i]) termsByVar[name].push_back(i);
+    }
+    std::unordered_set<std::string> visited;
+    std::vector<bool> visitedTerms(varsByTerm.size());
+    for (const std::string& root : m_randcVarNames) {
+        if (!visited.insert(root).second) continue;
+        std::vector<std::string> pending{root};
+        std::vector<std::string> randcNames;
+        std::vector<size_t> terms;
+        while (!pending.empty()) {
+            const std::string name = std::move(pending.back());
+            pending.pop_back();
+            if (m_randcVarNames.count(name)) randcNames.push_back(name);
+            for (const size_t i : termsByVar[name]) {
+                if (visitedTerms[i]) continue;
+                visitedTerms[i] = true;
+                if (i < exprCount) terms.push_back(i);
+                for (const auto& next : varsByTerm[i]) {
+                    if (visited.insert(next).second) pending.push_back(next);
+                }
             }
-        };
-        // Include transitive constraints, e.g. c == x and x == a[0].
-        size_t oldSize;
-        do {
-            oldSize = related.size();
-            size_t begin = 0;
-            for (size_t i = 0; i < m_constraints.size(); ++i) {
-                const size_t end = m_constraintVarEnds[i];
-                connect(i, m_constraintVarNames.begin() + begin,
-                        m_constraintVarNames.begin() + end);
-                begin = end;
-            }
-            for (size_t i = 0; i < groupIds.size(); ++i) {
-                const auto& names = m_uniqueArrays.at(groupIds[i]);
-                connect(m_constraints.size() + i, names.begin(), names.end());
-            }
-        } while (related.size() != oldSize);
+        }
+        // Hash in constraint order, independent of the traversal and container order.
+        std::sort(terms.begin(), terms.end());
         size_t hash = 0;
-        for (size_t term : terms) {
+        for (const size_t term : terms) {
             const std::string& expr = term < m_constraints.size()
                                           ? m_constraints[term]
                                           : uniqueExprs[term - m_constraints.size()];
             hash ^= std::hash<std::string>{}(expr) + 0x9e3779b9 + (hash << 6) + (hash >> 2);
         }
-        size_t& previous = m_randcConstraintHashes[name];
-        if (hash != previous) {
-            m_randcUsedValues.erase(name);
-            previous = hash;
+        for (const auto& name : randcNames) {
+            size_t& previous = m_randcConstraintHashes[name];
+            if (hash != previous) {
+                m_randcUsedValues.erase(name);
+                previous = hash;
+            }
         }
     }
 }
@@ -993,14 +1010,22 @@ bool VlRandomizer::isFrozenVar(const std::string& name, const VlRandomVar& var) 
 }
 
 bool VlRandomizer::hasFrozenVar() const {
-    bool mayBeFrozen = m_randmodep || m_static_randmodep;
-    // A disabled var means the class uses rand_mode, so it never shows up without one
-    if (VL_UNCOVERABLE(!mayBeFrozen && !m_disabledVars.empty())) mayBeFrozen = true;
-    if (!mayBeFrozen) return false;
+    if (!m_randmodep && !m_static_randmodep && m_disabledVars.empty()) return false;
     for (const auto& var : m_vars) {
         if (isFrozenVar(var.first, *var.second)) return true;
     }
     return false;
+}
+
+std::string VlRandomizer::guardSize(const char* arrayp, const char* sizep, uint32_t index,
+                                    std::string term) const {
+    for (const char* namep : m_sizeArrays) {
+        if (std::strcmp(namep, arrayp) == 0) {
+            return "(__Vbv (=> (bvult (_ bv" + std::to_string(index) + " 32) " + sizep
+                   + ") (__Vbool " + term + ")))";
+        }
+    }
+    return term;
 }
 
 bool VlRandomizer::next_check_only(VlRNGReseeds& rngr) { return nextRandomize(rngr, true); }
@@ -1829,6 +1854,7 @@ void VlRandomizer::disable_soft(const std::string& varName) {
 }
 
 void VlRandomizer::clearConstraints() {
+    m_sizeArrays.clear();
     m_constraints.clear();
     m_constraintVarNames.clear();
     m_constraintVarEnds.clear();
@@ -1840,17 +1866,22 @@ void VlRandomizer::clearConstraints() {
 }
 
 void VlRandomizer::clearAll() {
+    m_sizeArrays.clear();
     m_constraints.clear();
     m_constraintVarNames.clear();
     m_constraintVarEnds.clear();
     m_softConstraints.clear();
     m_vars.clear();
     m_randcVarNames.clear();
+    m_randcAliases.clear();
     m_randcUsedValues.clear();
     m_randcConstraintHashes.clear();
 }
 
-void VlRandomizer::markRandc(const std::string& name) { m_randcVarNames.insert(name); }
+void VlRandomizer::markRandc(const std::string& name, const char* aliasp) {
+    m_randcVarNames.insert(name);
+    if (aliasp) m_randcAliases.emplace(name, aliasp);
+}
 
 void VlRandomizer::solveBefore(const std::string& beforeName, const std::string& afterName) {
     m_solveBefore.emplace_back(beforeName, afterName);
