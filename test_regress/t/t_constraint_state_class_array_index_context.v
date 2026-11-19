@@ -11,6 +11,7 @@
 
 class Entry;
   bit mark;
+  int value;
   int offset;
   function int get_offset();
     return offset;
@@ -51,6 +52,38 @@ class Reduced;
   rand bit dummy[1];
   Entry entries[4];
   constraint one {ids.sum() with (int'(entries[item].mark)) == 1;}
+endclass
+
+class FunctionReduction;
+  rand bit values[2];
+  function int sum_arg(int ignored, bit value);
+    return int'(value);
+  endfunction
+  constraint one {values.sum() with (sum_arg(0, item)) == 1;}
+endclass
+
+class NativeReduction;
+  Entry entries[4];
+  int ids[2];
+  rand int idx;
+  constraint one {
+    entries[idx].mark && ids.sum() with (int'(entries[item].mark)) == 1;
+  }
+endclass
+
+class ShortCircuitReduction;
+  Entry entries[2], holder;
+  rand bit ids[1];
+  constraint one {
+    ids.sum() with (int'(item == 0 || entries[item].mark == holder.mark)) == 1;
+  }
+endclass
+
+class StateIndices;
+  Entry q[$], d[], a[int];
+  int key;
+  rand bit choice;
+  constraint valid {choice == (q[key].mark && d[key].mark && a[key].mark);}
 endclass
 
 module t;
@@ -156,6 +189,84 @@ module t;
     ok = pick(1);
     `checkd(ok, 1)
     `checkd(idx, 32'd1)
+
+    begin
+      automatic FunctionReduction func = new;
+      func.values = '{0, 0};
+      repeat (4) begin
+        ok = func.randomize();
+        `checkd(ok, 1)
+        `checkd(int'(func.values[0]) + int'(func.values[1]), 1)
+      end
+    end
+    begin
+      automatic NativeReduction native_red = new;
+      foreach (native_red.entries[i]) native_red.entries[i] = new;
+      native_red.entries[1].mark = 1;
+      native_red.ids = '{0, 1};
+      ok = native_red.randomize();
+      `checkd(ok, 1)
+      `checkd(native_red.idx, 1)
+      native_red.entries[0] = null;
+      ok = native_red.randomize();
+      `checkd(ok, 0)
+    end
+    begin
+      automatic ShortCircuitReduction sc = new;
+      sc.entries[1] = new;
+      ok = sc.randomize() with {ids[0] == 0;};
+      `checkd(ok, 1)
+      ok = sc.randomize() with {ids[0] == 1;};
+      `checkd(ok, 0)
+      sc.holder = new;
+      ok = sc.randomize() with {ids[0] == 1;};
+      `checkd(ok, 1)
+    end
+    begin
+      automatic StateIndices state_idx = new;
+      automatic Entry value = new;
+      state_idx.d = new[1];
+      state_idx.q.push_back(value);
+      state_idx.d[0] = value;
+      state_idx.a[0] = value;
+      value.mark = 1;
+      ok = state_idx.randomize();
+      `checkd(ok, 1)
+      `checkd(state_idx.choice, 1)
+      value.mark = 0;
+      ok = state_idx.randomize();
+      `checkd(ok, 1)
+      `checkd(state_idx.choice, 0)
+    end
+
+    begin
+      int other;
+      Entry offset_entries[4:7];
+      foreach (entries[i]) entries[i] = new;
+      idx = 1;
+      other = 2;
+      entries[other].value = 9;
+      ok = std::randomize(entries[idx].value) with {
+        entries[idx].value == 5;
+        entries[other].value == 9;
+      };
+      `checkd(ok, 1)
+      `checkd(entries[idx].value, 5)
+      `checkd(entries[other].value, 9)
+      idx = 9;
+      ok = std::randomize(entries[idx[1:0]].value) with {
+        entries[idx[1:0]].value == 6;
+        entries[idx[3:2]].value == 9;
+      };
+      `checkd(ok, 1)
+      `checkd(entries[1].value, 6)
+      `checkd(entries[2].value, 9)
+      foreach (offset_entries[i]) offset_entries[i] = new;
+      idx = 6;
+      ok = std::randomize(offset_entries[idx].value) with {offset_entries[idx].value == 7;};
+      `checkd(ok, 1)
+      `checkd(offset_entries[6].value, 7)
+    end
 
     $write("*-* All Finished *-*\n");
     $finish;

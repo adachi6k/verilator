@@ -4964,6 +4964,8 @@ public:
         init(fromp);
     }
     ASTGEN_MEMBERS_AstArraySel;
+    void dump(std::ostream& str) const override;
+    void dumpJson(std::ostream& str) const override;
     int constraintIndexWidth() const { return m_constraintIndexWidth; }
     void constraintIndexWidth(int width) { m_constraintIndexWidth = width; }
     void numberOperate(V3Number&, const V3Number&, const V3Number&) override { V3ERROR_NA; }
@@ -4977,7 +4979,9 @@ public:
     bool sizeMattersRhs() const override { return false; }
     bool isGateOptimizable() const override { return true; }  // esp for V3Const::ifSameAssign
     bool isPredictOptimizable() const override { return true; }
-    bool sameNode(const AstNode* /*samep*/) const override { return true; }
+    bool sameNode(const AstNode* samep) const override {
+        return constraintIndexWidth() == VN_DBG_AS(samep, ArraySel)->constraintIndexWidth();
+    }
     int instrCount() const override { return widthInstrs(); }
 };
 class AstAssocSel final : public AstNodeSel {

@@ -390,6 +390,7 @@ class WidthVisitor final : public VNVisitor {
     AstNodeFTask* m_ftaskp = nullptr;  // Current function/task
     AstProperty* m_propertyp = nullptr;  // Current property
     AstNodeModule* m_modep = nullptr;  // Current module
+    bool m_inStdRandArgs = false;  // Arguments matched against a std::randomize with-clause
     const AstConstraint* m_constraintp = nullptr;  // Current constraint
     AstNodeProcedure* m_procedurep = nullptr;  // Current final/always
     const AstNode* m_writerp = nullptr;  // Assign, release or driving pin whose lvalue is iterated
@@ -1785,7 +1786,8 @@ class WidthVisitor final : public VNVisitor {
         AstNodeExpr* const fromp = nodep->fromp();
         // A function body or array lambda may later be inlined into a constraint.
         const bool constraint
-            = v3Global.useRandomizeMethods() && (m_constraintp || m_funcp || !m_withs.empty());
+            = v3Global.useRandomizeMethods()
+              && (m_constraintp || m_funcp || !m_withs.empty() || m_inStdRandArgs);
         AstNode* const selp = V3Width::widthSelNoIterEdit(nodep, constraint);
         if (selp != nodep) {
             VL_DANGLING(nodep);
@@ -9136,8 +9138,13 @@ class WidthVisitor final : public VNVisitor {
                 AstNodeDType* const adtypep = nodep->findBitDType();
                 withp = methodWithClause(nodep, false, false, adtypep->findVoidDType(),
                                          adtypep->findBitDType(), adtypep);
-                for (const AstArg* const argp : nodep->argspList()) {
-                    userIterateAndNext(argp->exprp(), WidthVP{SELF, BOTH}.p());
+                {
+                    // Preserve the same subscript expression on both sides of argument matching.
+                    VL_RESTORER(m_inStdRandArgs);
+                    m_inStdRandArgs = withp && nodep->name() == "randomize";
+                    for (const AstArg* const argp : nodep->argspList()) {
+                        userIterateAndNext(argp->exprp(), WidthVP{SELF, BOTH}.p());
+                    }
                 }
                 handleStdRandomizeArgs(nodep);  // Provided args should be in current scope
                 processFTaskRefArgs(nodep);

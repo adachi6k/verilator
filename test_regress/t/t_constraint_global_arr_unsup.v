@@ -8,6 +8,7 @@
 class Inner;
   rand int m_x;
   rand int m_y;
+  bit mark;
 endclass
 
 typedef struct {
@@ -56,6 +57,12 @@ class Outer;
   constraint c_bad_index {
     foreach(m_mid.m_assoc[i])
       m_mid.m_assoc[i].m_x == 1;
+  }
+  Inner pending[$], dynamic_entries[], associative_entries[int];
+  constraint indexed_state {
+    pending[m_idx].mark;
+    dynamic_entries[m_idx].mark;
+    associative_entries[m_idx].mark;
   }
 endclass
 

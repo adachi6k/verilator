@@ -22,6 +22,10 @@ package PkgImp;
   export Pkg::*;
 endpackage
 
+class MarkedEntry;
+  bit marked;
+endclass
+
 class Cls;
   bit cg_clk;
   int member = 1;
@@ -31,6 +35,8 @@ class Cls;
   rand int rmember2;
   randc bit [1:0] rcmember;
   rand int rarray[3];
+  MarkedEntry entries[3];
+  constraint state_field {entries[rmember1].marked;}
   constraint array_values {
     solve rarray[0] before rmember1;
     foreach (rarray[i]) rarray[i] == rmember1 + i;

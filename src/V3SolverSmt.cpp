@@ -573,6 +573,18 @@ class ConstraintExprVisitor final : public VNVisitor {
             return callp->taskp() && !callp->taskp()->isStatic() ? callp->fromp() : nullptr;
         return nullptr;
     }
+    static bool isReduction(VCMethod method) {
+        return method == VCMethod::ARRAY_R_SUM || method == VCMethod::ARRAY_R_PRODUCT
+               || method == VCMethod::ARRAY_R_AND || method == VCMethod::ARRAY_R_OR
+               || method == VCMethod::ARRAY_R_XOR;
+    }
+    static bool needsStateGuards(AstNode* exprp) {
+        return exprp->exists([](AstNodeExpr* termp) {
+            if (AstMemberRef* const refp = VN_CAST(termp, MemberRef))
+                return !V3Randomize::stateMemberArraySels(refp).empty();
+            return VN_IS(termp, NodeFTaskRef) && termp->user1();
+        });
+    }
     // Native SMT arguments are formatted before the solver chooses a branch. Check only
     // receivers evaluated by the SV expression, in their original short-circuit order.
     static AstNodeExpr* stateReadValidp(AstNode* nodep) {
@@ -602,6 +614,28 @@ class ConstraintExprVisitor final : public VNVisitor {
                 new AstCond{fl, condp->cloneTreePure(false),
                             tvalidp ? tvalidp : new AstConst{fl, AstConst::BitTrue{}},
                             evalidp ? evalidp : new AstConst{fl, AstConst::BitTrue{}}});
+        }
+        if (AstCMethodHard* const callp = VN_CAST(nodep, CMethodHard)) {
+            if (callp->withp() && isReduction(callp->method())) {
+                AstWith* const withp = callp->withp();
+                // A lambda's item is in scope only inside its own array method.
+                AstNodeExpr* const baseValidp = stateReadValidp(callp->fromp());
+                AstWith* const checkp = withp->cloneTree(false);
+                AstNode* const bodyp = checkp->exprp();
+                AstNodeExpr* const itemValidp = stateReadValidp(bodyp);
+                if (!itemValidp) {
+                    VL_DO_DANGLING(checkp->deleteTree(), checkp);
+                    return baseValidp;
+                }
+                bodyp->replaceWith(new AstLogNot{fl, itemValidp});
+                VL_DO_DANGLING(bodyp->deleteTree(), bodyp);
+                checkp->dtypeSetBit();
+                AstCMethodHard* const missingp = new AstCMethodHard{
+                    fl, callp->fromp()->cloneTreePure(false), VCMethod::ARRAY_R_OR};
+                missingp->withp(checkp);
+                missingp->dtypeSetBit();
+                return bothPresentp(fl, baseValidp, new AstLogNot{fl, missingp});
+            }
         }
         AstNodeExpr* validp = nullptr;
         for (AstNode* childp : {nodep->op1p(), nodep->op2p(), nodep->op3p(), nodep->op4p()}) {
@@ -852,39 +886,23 @@ class ConstraintExprVisitor final : public VNVisitor {
     }
 
     // Bottom-up user1 propagation on inlined expression tree
-    void propagateUser1InlineRecurse(AstNodeExpr* nodep, bool markedLeaves = false) {
-        if (VN_IS(nodep, NodeVarRef)) {
+    static bool propagateUser1InlineRecurse(AstNode* nodep, bool markedLeaves = false) {
+        if (const AstNodeVarRef* const refp = VN_CAST(nodep, NodeVarRef)) {
             if (!markedLeaves) {
-                const AstVar* const varp = VN_AS(nodep, NodeVarRef)->varp();
+                const AstVar* const varp = refp->varp();
                 nodep->user1(nodep->user1() || varp->rand().isRandomizable()
                              || varp->isStdRandomizeArg());
             }
-            return;
+            return nodep->user1();
         }
-        if (VN_IS(nodep, Const)) {
-            nodep->user1(false);
-            return;
+        bool depends = false;
+        for (AstNode* childp : {nodep->op1p(), nodep->op2p(), nodep->op3p(), nodep->op4p()}) {
+            for (; childp; childp = childp->nextp())
+                depends |= propagateUser1InlineRecurse(childp, markedLeaves);
         }
-        int anyChild = false;  // Used as bool
-        if (AstNodeExpr* const cp = VN_CAST(nodep->op1p(), NodeExpr)) {
-            propagateUser1InlineRecurse(cp, markedLeaves);
-            anyChild |= cp->user1();
-        }
-        if (AstNodeExpr* const cp = VN_CAST(nodep->op2p(), NodeExpr)) {
-            propagateUser1InlineRecurse(cp, markedLeaves);
-            anyChild |= cp->user1();
-        }
-        if (AstNodeExpr* const cp = VN_CAST(nodep->op3p(), NodeExpr)) {
-            propagateUser1InlineRecurse(cp, markedLeaves);
-            anyChild |= cp->user1();
-        }
-        if (AstNodeExpr* const cp = VN_CAST(nodep->op4p(), NodeExpr)) {
-            propagateUser1InlineRecurse(cp, markedLeaves);
-            anyChild |= cp->user1();
-        }
-        nodep->user1(anyChild);
+        if (VN_IS(nodep, NodeExpr)) nodep->user1(depends);
+        return depends;
     }
-
     // Prepend the bucket preamble stmts stored on user3p by lowerDistConstraints to the
     // statements that will become the body of the generated AstForeach, so the per-element
     // bucket draw is evaluated in the same scope as its references.
@@ -2230,7 +2248,15 @@ class ConstraintExprVisitor final : public VNVisitor {
         relinker.relink(bindStateValuep(fl, fieldWidth, tablep));
     }
     void visit(AstMemberRef* nodep) override {
-        const std::vector<AstArraySel*> selectors = V3Randomize::stateMemberArraySels(nodep);
+        bool unsupported = false;
+        const auto selectors = V3Randomize::stateMemberArraySels(nodep, &unsupported);
+        if (unsupported) {
+            nodep->v3warn(E_UNSUPPORTED, "Unsupported: Solver-dependent index into a non-fixed "
+                                         "class-handle array in a state field constraint");
+            nodep->user1(false);
+            editFormat(nodep);
+            return;
+        }
         if (!selectors.empty()) {
             editStateMemberSel(nodep, selectors);
             return;
@@ -2679,12 +2705,7 @@ class ConstraintExprVisitor final : public VNVisitor {
             }
         }
         VL_RESTORER(m_guardStateReads);
-        // A projected field can also appear after a constraint function is inlined.
-        m_guardStateReads |= nodep->exprp()->exists([](AstNodeExpr* termp) {
-            if (AstMemberRef* const refp = VN_CAST(termp, MemberRef))
-                return !V3Randomize::stateMemberArraySels(refp).empty();
-            return VN_IS(termp, NodeFTaskRef) && termp->user1();
-        });
+        m_guardStateReads |= needsStateGuards(nodep->exprp());
         const size_t first = m_stateLookups.size();
         iterateChildren(nodep);
         if (first != m_stateLookups.size()) {
@@ -2848,11 +2869,7 @@ class ConstraintExprVisitor final : public VNVisitor {
         }
 
         // Array reduction methods (sum, product, and, or, xor)
-        if (nodep->method() == VCMethod::ARRAY_R_SUM
-            || nodep->method() == VCMethod::ARRAY_R_PRODUCT
-            || nodep->method() == VCMethod::ARRAY_R_AND || nodep->method() == VCMethod::ARRAY_R_OR
-            || nodep->method() == VCMethod::ARRAY_R_XOR) {
-
+        if (isReduction(nodep->method())) {
             AstWith* const withp = nodep->withp();
 
             // For 'with' clause: check array size limit and item.index support
@@ -3000,6 +3017,8 @@ class ConstraintExprVisitor final : public VNVisitor {
                 // Substituting item adds the array element's dependencies, not the loop index.
                 propagateUser1InlineRecurse(VN_AS(perElemExprp, NodeExpr), true);
 
+                VL_RESTORER(m_guardStateReads);
+                m_guardStateReads |= needsStateGuards(perElemExprp);
                 const size_t first = m_stateLookups.size();
                 AstNodeExpr* termp = VN_AS(iterateSubtreeReturnEdits(perElemExprp), NodeExpr);
                 if (m_stateLookups.size() != first) {

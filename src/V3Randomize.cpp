@@ -203,6 +203,25 @@ void V3Randomize::narrowConstraintIndex(AstArraySel* selp) {
     if (VN_IS(indexp, Const)) V3Const::constifyEdit(narrowp);
 }
 
+// Compare a std::randomize argument with a use in its inline constraint.
+static bool sameStdRandArg(const AstNodeExpr* usep, const AstNodeExpr* argp) {
+    if (const AstVarRef* const refp = VN_CAST(argp, VarRef)) {
+        const AstVarRef* const useRefp = VN_CAST(usep, VarRef);
+        return useRefp && useRefp->varp() == refp->varp();
+    }
+    if (const AstMemberRef* const refp = VN_CAST(argp, MemberRef)) {
+        const AstMemberRef* const useRefp = VN_CAST(usep, MemberRef);
+        return useRefp && useRefp->varp() == refp->varp()
+               && sameStdRandArg(useRefp->fromp(), refp->fromp());
+    }
+    if (const AstArraySel* const selp = VN_CAST(argp, ArraySel)) {
+        const AstArraySel* const useSelp = VN_CAST(usep, ArraySel);
+        return useSelp && selp->bitp()->isPure() && selp->bitp()->sameTree(useSelp->bitp())
+               && sameStdRandArg(useSelp->fromp(), selp->fromp());
+    }
+    return false;
+}
+
 // Visitor that marks classes needing a randomize() method
 
 class RandomizeMarkVisitor final : public VNVisitor {
@@ -245,7 +264,7 @@ class RandomizeMarkVisitor final : public VNVisitor {
         }
     }
     // Check if a variable is listed in std::randomize() arguments
-    bool isVarInStdRandomizeArgs(const AstVar* varp) const {
+    bool isVarInStdRandomizeArgs(const AstNodeExpr* usep) const {
         if (!m_inStdWith || !m_stdRandCallp) return false;
 
         for (AstArg* const argp : m_stdRandCallp->argspList()) {
@@ -253,11 +272,12 @@ class RandomizeMarkVisitor final : public VNVisitor {
             // Traverse through expression to find the base variable
             while (exprp) {
                 if (const AstNodeVarRef* const varrefp = VN_CAST(exprp, NodeVarRef)) {
-                    if (varrefp->varp() == varp) return true;
+                    const AstNodeVarRef* const refp = VN_CAST(usep, NodeVarRef);
+                    if (refp && refp->varp() == varrefp->varp()) return true;
                     break;
                 }
                 if (const AstMemberRef* const memberRefp = VN_CAST(exprp, MemberRef)) {
-                    if (memberRefp->varp() == varp) return true;
+                    if (sameStdRandArg(usep, memberRefp)) return true;
                     exprp = memberRefp->fromp();
                 } else if (const AstArraySel* const arrselp = VN_CAST(exprp, ArraySel)) {
                     exprp = arrselp->fromp();
@@ -694,6 +714,14 @@ class RandomizeMarkVisitor final : public VNVisitor {
         if (nodep->classOrPackagep()->name() == "std") {
             m_stdRandCallp = nullptr;
             for (AstArg* const argp : nodep->argspList()) {
+                if (nodep->withp()) {
+                    // The corresponding subscript in the with-clause receives the same qualifier.
+                    argp->foreach([&](AstArraySel* selp) {
+                        selp->bitp()->foreach([&](AstVarRef* refp) {
+                            if (refp->varp()->lifetime().isStatic()) m_staticRefs.emplace(refp);
+                        });
+                    });
+                }
                 handleRandomizeArgument(argp->exprp(), nullptr, true);
             }
             return;
@@ -763,7 +791,7 @@ class RandomizeMarkVisitor final : public VNVisitor {
         // Mark as randomizable if: rand-declared, or listed in std::randomize() args
         if (nodep->varp()->rand().isRandomizable() && !(m_inStdWith && m_stdRandCallp)) {
             nodep->user1(true);
-        } else if (isVarInStdRandomizeArgs(nodep->varp())) {
+        } else if (isVarInStdRandomizeArgs(nodep)) {
             nodep->user1(true);
         }
     }
@@ -773,10 +801,11 @@ class RandomizeMarkVisitor final : public VNVisitor {
         const bool randObject = nodep->fromp()->user1() || VN_IS(nodep->fromp(), LambdaArgRef);
         const bool randMember = nodep->varp()->rand().isRandomizable();
         const bool inStdWith = m_inStdWith && m_stdRandCallp;
-        const auto selectors = V3Randomize::stateMemberArraySels(nodep);
-        if ((randObject && randMember && !inStdWith) || !selectors.empty()) {
+        bool unsupported = false;
+        const auto selectors = V3Randomize::stateMemberArraySels(nodep, &unsupported);
+        if ((randObject && randMember && !inStdWith) || !selectors.empty() || unsupported) {
             nodep->user1(true);
-        } else if (inStdWith && isVarInStdRandomizeArgs(nodep->varp())) {
+        } else if (inStdWith && isVarInStdRandomizeArgs(nodep)) {
             nodep->user1(true);
             // Mark parent object for constraint expression visitor
             if (VN_IS(nodep->fromp(), VarRef)) nodep->fromp()->user1(true);
@@ -1165,40 +1194,6 @@ class RandomizeVisitor final : public VNVisitor {
     const std::unique_ptr<V3SolverLowering> m_solverp;  // Constraint solver lowering
 
     // METHODS
-    // Check if two nodes are semantically equivalent (not pointer equality):
-    static bool isSimilarNode(const AstNodeExpr* withExprp, const AstNodeExpr* argExprp) {
-        // VarRef: compare variable pointers
-        if (VN_IS(argExprp, VarRef) && VN_IS(withExprp, VarRef)) {
-            return VN_AS(withExprp, VarRef)->varp() == VN_AS(argExprp, VarRef)->varp();
-        }
-        // MemberRef: compare object and member (obj.y)
-        if (VN_IS(argExprp, MemberRef) && VN_IS(withExprp, MemberRef)) {
-            const AstMemberRef* const withRefp = VN_AS(withExprp, MemberRef);
-            const AstMemberRef* const argRefp = VN_AS(argExprp, MemberRef);
-            if (withRefp->varp() != argRefp->varp()) return false;
-            // Recursively compare the base object expression
-            return isSimilarNode(withRefp->fromp(), argRefp->fromp());
-        }
-        // ArraySel: compare array base and index (arr[i])
-        if (VN_IS(argExprp, ArraySel) && VN_IS(withExprp, ArraySel)) {
-            const AstArraySel* const withASp = VN_AS(withExprp, ArraySel);
-            const AstArraySel* const argASp = VN_AS(argExprp, ArraySel);
-            // Before checking Sel type index, check if both are Const
-            if (VN_IS(withASp->bitp(), Const) && VN_IS(argASp->bitp(), Const)) {
-                const AstConst* const withIdxp = VN_AS(withASp->bitp(), Const);
-                const AstConst* const argIdxp = VN_AS(argASp->bitp(), Const);
-                return isSimilarNode(withASp->fromp(), argASp->fromp())
-                       && withIdxp->num().isCaseEq(argIdxp->num());
-            }
-            // Index must be Sel type, extract VarRef using fromp()
-            if (!VN_IS(withASp->bitp(), Sel) || !VN_IS(argASp->bitp(), Sel)) return false;
-            const AstNodeExpr* const withIdxp = VN_AS(withASp->bitp(), Sel)->fromp();
-            const AstNodeExpr* const argIdxp = VN_AS(argASp->bitp(), Sel)->fromp();
-            return isSimilarNode(withASp->fromp(), argASp->fromp())
-                   && isSimilarNode(withIdxp, argIdxp);
-        }
-        return false;
-    }
     AstVar* createStdRandomGenerator(AstNodeModule* const modp) {
         auto it = m_stdMap.find(modp);
         if (it == m_stdMap.end()) {
@@ -2582,7 +2577,7 @@ class RandomizeVisitor final : public VNVisitor {
                 // Replace argument occurrences in 'with' clause with __Varg* reference.
                 if (withp) {
                     withp->foreach([&](AstNodeExpr* exp) {
-                        if (isSimilarNode(exp, exprp)) {
+                        if (sameStdRandArg(exp, exprp)) {
                             AstVarRef* const replaceVarp
                                 = new AstVarRef{exprp->fileline(), refvarp, VAccess::READWRITE};
                             exp->replaceWith(replaceVarp);
@@ -2813,13 +2808,17 @@ public:
 
 // A state field depends on every dimension when any index is solved. A rand handle
 // array can still contain non-rand fields, and std::randomize can freeze its root.
-std::vector<AstArraySel*> V3Randomize::stateMemberArraySels(AstMemberRef* memberp) {
+std::vector<AstArraySel*> V3Randomize::stateMemberArraySels(AstMemberRef* memberp,
+                                                            bool* unsupportedp) {
     if (!memberp->dtypep()->skipRefp()->isIntegralOrPacked()
-        || memberp->varp()->lifetime().isStatic())
+        || memberp->varp()->lifetime().isStatic()) {
+        if (unsupportedp) *unsupportedp = false;
         return {};
+    }
     std::vector<AstArraySel*> selectors;
     bool state = !memberp->varp()->rand().isRandomizable();
     bool symbolic = false;
+    bool nonFixedSymbolic = false;
     AstNodeExpr* receiverp = memberp->fromp();
     while (true) {
         if (const AstMemberRef* const innerp = VN_CAST(receiverp, MemberRef)) {
@@ -2830,10 +2829,20 @@ std::vector<AstArraySel*> V3Randomize::stateMemberArraySels(AstMemberRef* member
             state |= !selp->fromp()->user1();
             symbolic |= selp->bitp()->user1();
             receiverp = selp->fromp();
+        } else if (const AstAssocSel* const selp = VN_CAST(receiverp, AssocSel)) {
+            nonFixedSymbolic |= selp->bitp()->user1();
+            state |= !selp->fromp()->user1();
+            receiverp = selp->fromp();
+        } else if (const AstCMethodHard* const atp = VN_CAST(receiverp, CMethodHard)) {
+            if (atp->method() != VCMethod::ARRAY_AT || !atp->pinsp()) break;
+            nonFixedSymbolic |= atp->pinsp()->user1();
+            state |= !atp->fromp()->user1();
+            receiverp = atp->fromp();
         } else {
             break;
         }
     }
+    if (unsupportedp) *unsupportedp = state && nonFixedSymbolic;
     if (!state || !symbolic) return {};
     std::reverse(selectors.begin(), selectors.end());
     return selectors;
