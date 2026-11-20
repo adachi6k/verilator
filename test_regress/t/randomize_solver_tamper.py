@@ -11,25 +11,27 @@
 #
 # Input arguments from environment variables:
 # TAMPER: bad_base | bad_digits | bad_index | bad_value | bare_hash | binary
-#         | core_junk | crlf | die_at | die_status_at | diversity_model
-#         | dup_model | err_assume | err_core | err_multiline | err_once
-#         | err_phase | err_reply | err_trunc | err_unbal | err_unbal_cont
+#         | binary_literals | core_junk | crlf | die_at | die_status_at | diversity_model
+#         | dup_index | dup_model | err_assume | err_core | err_multiline | err_once
+#         | err_phase | err_reply | err_trunc | err_unbal | err_unbal_cont | extra_dimension
 #         | garbage_assume | garbage_at | garbage_model | garbage_status
 #         | high_digit | indent | low_digit | model_trunc | multiline | mute_at
 #         | no_digits | none | octal | oor_assume | phase_model | phase_trunc
-#         | short_model | stale_assume | success | unknown_once | unknown_twice
-#         | unknown_var | unsat_recheck | unsupported_once | upper_hex
+#         | short_index | short_model | stale_assume | success | unknown_index | unknown_once
+#         | unknown_twice | unknown_var | unsat_recheck | unsupported_once | upper_hex
 #   bad_base         - replace the Nth model reply with a base character that is not b, o, x or h
 #   bad_digits       - replace the Nth model reply with one value holding digits outside its base
 #   bad_index        - replace the first array model reply with a bad select index
 #   bad_value        - replace the Nth model reply with one well-formed value lacking a base
 #   bare_hash        - replace the Nth model reply with one value that is only "#"
 #   binary           - replace the Nth model reply with binary values
+#   binary_literals  - spell every hex bit-vector as an equivalent width-preserving binary literal
 #   core_junk        - prepend garbage to the core reply and close the pipe
 #   crlf             - end every line with CRLF
 #   die_at           - kill the solver at the Nth model reply and exit, closing every pipe end
 #   die_status_at    - kill the solver at the Nth status line and exit, closing every pipe end
 #   diversity_model  - replace the Nth array model reply with one holding an unusable value
+#   dup_index        - return one element under equivalent hex and binary indices
 #   dup_model        - replace the Nth model reply with one answering a variable twice
 #   err_assume       - replace the first unsat-assumptions reply with (error ...)
 #   err_core         - replace the first unsat-core reply with (error ...)
@@ -40,6 +42,7 @@
 #   err_trunc        - answer the Nth status with an unterminated (error and close the pipe
 #   err_unbal        - answer the Nth status with an error closing an extra paren
 #   err_unbal_cont   - answer the Nth status with an error, the extra paren on a continuation line
+#   extra_dimension  - return a nested select for a one-dimensional array
 #   garbage_assume   - answer the unsat assumptions with a non-S-expression word
 #   garbage_at       - replace every Nth model reply with a non-S-expression line
 #   garbage_model    - replace the Nth model reply with a partly valid one
@@ -56,9 +59,11 @@
 #   oor_assume       - answer the unsat assumptions with an out-of-range literal
 #   phase_model      - replace the final phased model reply with (error ...)
 #   phase_trunc      - answer an unterminated phase value reply and close the pipe
+#   short_index      - return a binary index narrower than the requested select
 #   short_model      - replace the Nth model reply with one omitting a requested variable
 #   stale_assume     - answer every unsat assumptions reply from the Nth with the literal __Va0
 #   success          - echo a print-success line before every reply
+#   unknown_index    - return a well-formed index for an unrequested array element
 #   unknown_once     - answer the Nth status with unknown
 #   unknown_twice    - answer two statuses with unknown
 #   unknown_var      - replace the Nth model reply with one naming a variable never requested
@@ -90,7 +95,7 @@ STATUS_MODES = ("die_status_at", "err_multiline", "err_once", "err_trunc", "err_
 # Modes acting on the TAMPER_AT'th S-expression reply of any kind
 REPLY_MODES = ("err_reply", )
 # Modes acting on an array model reply, which arrives as (select ...) terms
-SELECT_MODES = ("bad_index", "diversity_model")
+SELECT_MODES = ("bad_index", "diversity_model", "dup_index", "extra_dimension", "short_index", "unknown_index")
 # Modes acting on the status the solver sends after answering unsat
 RECHECK_MODES = ("unsat_recheck", )
 # phase_model acts on the final phased model; the others on any phase value reply
@@ -100,7 +105,7 @@ ASSUME_MODES = ("err_assume", "garbage_assume", "oor_assume", "stale_assume")
 # Modes acting on an unsat-core reply, which lists __Vcons<N> names
 CORE_MODES = ("core_junk", "err_core")
 # Modes rewriting every line, so they never consume the index
-STREAM_MODES = ("crlf", "indent", "multiline", "success")
+STREAM_MODES = ("binary_literals", "crlf", "indent", "multiline", "success")
 
 
 def real_solver():
@@ -123,6 +128,9 @@ def emit(text):
 
 def forward(text, at_start):
     """Pass a real reply through, applying the whole-stream rewrites"""
+    if mode == "binary_literals":
+        text = re.sub(r"#x([0-9a-fA-F]+)\b",
+                      lambda match: f"#b{int(match[1], 16):0{4 * len(match[1])}b}", text)
     # Solvers echo success per command, so never inside a wrapped S-expression
     if mode == "success" and at_start:
         emit("success")
@@ -218,8 +226,24 @@ for line in proc.stdout:
         swallow(line)
         continue
     if mode == "bad_index":
-        emit("(((select q #xgg) #x15) ((select q #x00000001) #x15)"
+        emit("(((select q #x000000gg) #x15) ((select q #x00000001) #x15)"
              " ((select q #x00000002) #x15))")
+        swallow(line)
+        continue
+    if mode == "extra_dimension":
+        emit("(((select q #x00000000) #x15) ((select (select q #x00000001) #x00000000) #x15)"
+             " ((select q #x00000002) #x15))")
+        swallow(line)
+        continue
+    if mode in ("dup_index", "short_index", "unknown_index"):
+        indices = [f"#b{i:032b}" for i in range(3)]
+        if mode == "dup_index":
+            indices[1] = "#x00000000"
+        elif mode == "short_index":
+            indices[1] = "#b01"
+        else:
+            indices[1] = "#x00000003"
+        emit("(" + " ".join(f"((select q {i}) #x15)" for i in indices) + ")")
         swallow(line)
         continue
     # A well-formed reply whose second value is unusable: the first must not

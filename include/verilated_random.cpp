@@ -798,6 +798,34 @@ static void parseSMTNum(int obits, WDataOutP owp, const std::string& val) {
     default: _vl_vsss_based(owp, obits, 4, &val[i], 0, val.size() - i); break;
     }
 }
+// Append the registered array key spelling for either SMT-LIB bit-vector literal.
+static bool appendSMTIndex(std::string& keyr, const std::string& index, size_t width) {
+    const size_t start = index.find_first_not_of(" \t\r\n");
+    if (start == std::string::npos) return false;
+    const std::string literal = index.substr(start, index.find_last_not_of(" \t\r\n") - start + 1);
+    if (literal.size() < 3 || literal[0] != '#') return false;
+    const bool binary = literal[1] == 'b';
+    if ((!binary && literal[1] != 'x') || literal.size() - 2 != (binary ? width : width / 4)
+        || !validSMTNum(literal)) {
+        return false;
+    }
+    std::vector<EData> words(VL_WORDS_I(width));
+    parseSMTNum(width, WDataOutP::external(words.data()), literal);
+    keyr += '[';
+    if (width <= VL_IDATASIZE) {
+        keyr += std::to_string(words.front());
+    } else {
+        std::ostringstream os;
+        size_t n = words.size();
+        while (n > 1 && !words[n - 1]) --n;
+        os << std::hex << words[--n] << std::setfill('0');
+        while (n) os << std::setw(8) << words[--n];
+        keyr += os.str();
+    }
+    keyr += ']';
+    return true;
+}
+
 void VlRandomVar::set(const std::string& idx, const std::string& val) const {
     VlWide<VL_WQ_WORDS_E> qowp;
     VL_SET_WQ(qowp, 0ULL);
@@ -1658,7 +1686,6 @@ bool VlRandomizer::parseModel(std::istream& is, size_t requested) {
         std::string value;
         std::vector<std::string> indices;
         is >> name;
-        indices.clear();
         if (name == "(select") {
             const std::string selectExpr = readUntilBalanced(is);
             name = parseNestedSelect(selectExpr, indices);
@@ -1672,7 +1699,35 @@ bool VlRandomizer::parseModel(std::istream& is, size_t requested) {
         }
         const VlRandomVar& varr = *it->second;
         std::string key = name;
-        for (const auto& index : indices) key += index;
+        if (varr.dimension() || !indices.empty()) {
+            const auto first = m_arr_vars.find(name + "0");
+            if (indices.empty() || !varr.dimension() || first == m_arr_vars.end()
+                || indices.size() != first->second->m_idxWidths.size()) {
+                VL_WARN_MT(__FILE__, __LINE__, "randomize",
+                           "Internal: Unable to parse solver's response: invalid array dimension");
+                return false;
+            }
+            const auto& widths = first->second->m_idxWidths;
+            for (size_t i = 0; i < indices.size(); ++i) {
+                if (!appendSMTIndex(key, indices[i], widths[i])) {
+                    VL_WARN_MT(__FILE__, __LINE__, "randomize",
+                               "Internal: Unable to parse solver's response: invalid array index");
+                    return false;
+                }
+            }
+            const auto itElement
+                = std::find_if(m_arr_vars.begin(), m_arr_vars.end(),
+                               [&key](const auto& entry) { return entry.second->m_name == key; });
+            if (itElement == m_arr_vars.end()) {
+                VL_WARN_MT(__FILE__, __LINE__, "randomize",
+                           "Internal: Unable to parse solver's response: unknown array element");
+                return false;
+            }
+            std::ostringstream ss;
+            ss << "#x" << std::hex << std::setw(8) << std::setfill('0')
+               << itElement->second->m_index;
+            idx = ss.str();
+        }
         if (!answered.insert(key).second) {
             VL_WARN_MT(__FILE__, __LINE__, "randomize",
                        "Internal: Unable to parse solver's response: repeated variable");
@@ -1686,48 +1741,6 @@ bool VlRandomizer::parseModel(std::istream& is, size_t requested) {
             if (modep && !modep->at(varr.randModeIdx())) continue;
         }
         if (m_disabledVars.count(name)) continue;
-        if (!indices.empty()) {
-            std::ostringstream oss;
-            oss << varr.name();
-            for (const auto& hex_index : indices) {
-                const size_t start = hex_index.find_first_not_of(" ");
-                if (start == std::string::npos || hex_index.substr(start, 2) != "#x") {
-                    VL_FATAL_MT(__FILE__, __LINE__, "randomize",
-                                "hex_index contains invalid format");
-                    continue;
-                }
-                std::string trimmed_hex = hex_index.substr(start + 2);
-                if (!validSMTNum(hex_index)) {
-                    VL_WARN_MT(__FILE__, __LINE__, "randomize",
-                               "Internal: Unable to parse solver's response: invalid array index");
-                    return false;
-                }
-
-                if (trimmed_hex.size() <= 8) {  // Small numbers: <= 32 bits
-                    // Convert to decimal and output directly
-                    oss << "[" << std::to_string(std::stoll(trimmed_hex, nullptr, 16)) << "]";
-                } else {  // Large numbers: > 32 bits
-                    // Trim leading zeros and handle empty case
-                    trimmed_hex.erase(0, trimmed_hex.find_first_not_of('0'));
-                    oss << "[" << (trimmed_hex.empty() ? "0" : trimmed_hex) << "]";
-                }
-            }
-            const std::string indexed_name = oss.str();
-
-            const auto iti = std::find_if(m_arr_vars.begin(), m_arr_vars.end(),
-                                          [&indexed_name](const auto& entry) {
-                                              return entry.second->m_name == indexed_name;
-                                          });
-            if (iti != m_arr_vars.end()) {
-                std::ostringstream ss;
-                ss << "#x" << std::hex << std::setw(8) << std::setfill('0')
-                   << iti->second->m_index;
-                idx = ss.str();
-            } else {
-                VL_FATAL_MT(__FILE__, __LINE__, "randomize",
-                            "indexed_name not found in m_arr_vars");
-            }
-        }
         // Reject before any commit, so a bad value later in the reply cannot
         // leave earlier ones written
         if (!validSMTNum(value)) {
