@@ -1842,12 +1842,21 @@ class RandomizeVisitor final : public VNVisitor {
             return VN_IS(dtypep, ClassRefDType);
         });
     }
-    // True if this class owns a global constraint: a member-select chain rooted
-    // at a rand class-typed handle reaching into a sub-object.
+    // A constrained random field reached through random class handles belongs to this solve.
+    // A state-only leaf such as b.cfg.length does not make its owner globally constrained.
     bool classOwnsGlobalConstraint(const AstClass* classp) const {
         return classp->existsMember([](const AstClass*, const AstConstraint* constrp) {
             bool owns = false;
+            std::unordered_set<const AstMemberRef*> receivers;
             constrp->foreach([&](const AstMemberRef* memberRefp) {
+                if (owns) return;
+                // foreach visits a field before its receiver. In b.cfgs[i].field, only
+                // b.cfgs supplies the object. Fields in the index are separate operands.
+                if (const AstMemberRef* const receiverp
+                    = VN_CAST(memberRefp->fromp()->getVAccessTargetRecurse(), MemberRef)) {
+                    receivers.insert(receiverp);
+                }
+                if (receivers.erase(memberRefp) || !memberRefp->user1()) return;
                 const AstNode* const rootp
                     = const_cast<AstMemberRef*>(memberRefp)->baseFromp(true);
                 if (const AstVarRef* const refp = VN_CAST(rootp, VarRef)) {

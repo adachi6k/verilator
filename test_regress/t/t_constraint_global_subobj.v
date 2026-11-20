@@ -83,6 +83,71 @@ class A4;
   endfunction
 endclass
 
+// Scenario 5: state fields supply the size, including through nested rand handles.
+class C5;
+  rand int count;
+  int length;
+endclass
+
+class B5;
+  rand C5 cfg = new;
+  rand C5 cfgs[1];
+  rand C5 dynamic_cfgs[];
+  rand C5 by_key[int][1];
+  rand C5 queued[$];
+
+  function new();
+    cfgs[0] = cfg;
+    dynamic_cfgs = new[1];
+    dynamic_cfgs[0] = cfg;
+    by_key[7][0] = cfg;
+    queued.push_back(cfg);
+  endfunction
+endclass
+
+class A5;
+  typedef enum bit [1:0] {
+    A = 1,
+    B = 2
+  } value_t;
+  C5 cfg = new;
+  rand B5 b = new;
+  rand value_t arr[];
+  constraint c_size {
+    arr.size() == cfg.count;
+    arr.size() == b.cfg.length;
+    arr.size() == b.cfgs[0].length;
+    arr.size() == b.dynamic_cfgs[0].length;
+    arr.size() == b.by_key[7][0].length;
+    arr.size() == b.queued[$].length;
+  }
+
+  function void check_size(int n);
+    cfg.count = n;
+    b.cfg.length = n;
+    if (this.randomize() != 1) $stop;
+    if (cfg.count != n || b.cfg.length != n || arr.size() != n) $stop;
+    foreach (arr[i]) begin
+      if (!(arr[i] inside {A, B})) $fatal(1, "arr[%0d]=%0d, size=%0d", i, arr[i], n);
+    end
+  endfunction
+endclass
+
+// Scenario 6: a random child field used as an index is itself constrained.
+class Index6;
+  rand bit [2:0] idx;
+endclass
+
+class A6;
+  rand Index6 child = new;
+  rand bit flags[8];
+  int chosen;
+  constraint c {
+    foreach (flags[i]) flags[i] == (i == chosen);
+    flags[child.idx] == 1;
+  }
+endclass
+
 module t_constraint_global_subobj;
   B1 b1;
   SA2 a2;
@@ -90,6 +155,8 @@ module t_constraint_global_subobj;
   M3 m3;
   C3 s3;
   A4 a4;
+  A5 a5;
+  A6 a6;
   int prevx, prevy, p3;
   bit varyx, varyy, vary3;
 
@@ -170,6 +237,20 @@ module t_constraint_global_subobj;
     if (a4.arr.size() != 4) begin
       $display("ERROR: a4.arr.size() should be 4, got %0d", a4.arr.size());
       $stop;
+    end
+
+    a5 = new;
+    a5.check_size(4);
+    a5.check_size(7);
+    a5.check_size(2);
+    a5.check_size(0);
+    a5.check_size(3);
+
+    a6 = new;
+    for (int i = 0; i < 8; i++) begin
+      a6.chosen = i;
+      if (a6.randomize() != 1) $stop;
+      if (int'(a6.child.idx) != i) $fatal(1, "child.idx=%0d, expected %0d", a6.child.idx, i);
     end
 
     $write("*-* All Finished *-*\n");
